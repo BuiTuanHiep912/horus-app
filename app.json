@@ -2,6 +2,7 @@
   "expo": {
     "name": "expo-camera-trigger-app",
     "slug": "expo-camera-trigger-app",
+    "scheme": "horusapp",
     "version": "1.0.0",
     "sdkVersion": "54.0.0",
     "experiments": {

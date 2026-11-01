@@ -1,7 +1,7 @@
 /**
- * Android-only local Expo module that records a react-native-webrtc camera track to MP4
+ * Local Expo module (Android + iOS) that records a react-native-webrtc camera track to MP4
  * from raw capture frames while the same track feeds the mediasoup live preview.
- * On iOS/web or in a build without the native module, `WebrtcRecorder` is null and
+ * On web or in a build without the native module, `WebrtcRecorder` is null and
  * `start`/`stop` reject with an unsupported-platform error.
  */
 import { requireOptionalNativeModule, type NativeModule } from 'expo';
@@ -78,14 +78,18 @@ export function isWebrtcRecorderSupported(): boolean {
 
 export async function start(opts: StartRecordingOptions): Promise<StartRecordingResult> {
   if (!WebrtcRecorder) {
-    throw new Error('WebrtcRecorder is only supported on Android dev-client builds');
+    throw new Error(
+      'WebrtcRecorder native module is not available (Android/iOS dev-client or release build required)',
+    );
   }
   return WebrtcRecorder.start(opts);
 }
 
 export async function stop(recordingId: string): Promise<StopRecordingResult> {
   if (!WebrtcRecorder) {
-    throw new Error('WebrtcRecorder is only supported on Android dev-client builds');
+    throw new Error(
+      'WebrtcRecorder native module is not available (Android/iOS dev-client or release build required)',
+    );
   }
   return WebrtcRecorder.stop(recordingId);
 }

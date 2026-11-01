@@ -27,8 +27,8 @@ import {
   stopProbe,
 } from './recorderProbe';
 
-// Name kept from the Android-only version; now also true on iOS (modules/webrtc-recorder/ios).
-const useAndroidRecorderCapture = () =>
+// WebRTC track recorder capture (modules/webrtc-recorder): Android + iOS.
+const isTrackRecorderCaptureEnabled = () =>
   ((Platform.OS === 'android' && USE_WEBRTC_RECORDER_ON_ANDROID) ||
     (Platform.OS === 'ios' && USE_WEBRTC_RECORDER_ON_IOS)) &&
   WebrtcRecorder != null;
@@ -127,7 +127,7 @@ class MediasoupClientService {
       noiseSuppression: true,
       autoGainControl: true,
     };
-    const want1080p = isProbeActive() || useAndroidRecorderCapture();
+    const want1080p = isProbeActive() || isTrackRecorderCaptureEnabled();
     try {
       this.localStream = await (
         wrtc.mediaDevices as unknown as { getUserMedia: (c: unknown) => Promise<any> }
@@ -238,7 +238,7 @@ class MediasoupClientService {
         encodings: PROBE_ENCODINGS,
       });
       await applyProbeSenderParams(this.videoProducer);
-    } else if (videoTrack && useAndroidRecorderCapture()) {
+    } else if (videoTrack && isTrackRecorderCaptureEnabled()) {
       // M4: attach raw-frame recorder tap on the 1080p30 track, produce low-bitrate preview
       this.attachRecorderTap(videoTrack);
       this.videoProducer = await this.sendTransport.produce({
@@ -261,6 +261,31 @@ class MediasoupClientService {
         logger.info('sendTransport state after 2s ' + (this.sendTransport as any)?.connectionState),
       2000,
     );
+    // Debug: confirms the preview really carries mic audio (on iOS it comes from the custom
+    // WRAudioDevice, not WebRTC's built-in one).
+    setTimeout(() => void this.logAudioSendStats(), 5000);
+  }
+
+  private async logAudioSendStats(): Promise<void> {
+    try {
+      const report = await this.audioProducer?.getStats();
+      report?.forEach((r: any) => {
+        if (r.type === 'outbound-rtp') {
+          logger.debug('[audio] preview send', {
+            packetsSent: r.packetsSent,
+            bytesSent: r.bytesSent,
+          });
+        } else if (r.type === 'media-source') {
+          // Non-zero energy means real mic samples, not silence.
+          logger.debug('[audio] preview source', {
+            audioLevel: r.audioLevel,
+            totalAudioEnergy: r.totalAudioEnergy,
+          });
+        }
+      });
+    } catch (e) {
+      logger.debug('[audio] getStats failed', e);
+    }
   }
 
   public async switchCamera(): Promise<'user' | 'environment'> {
@@ -273,7 +298,7 @@ class MediasoupClientService {
     const newStream = await (
       wrtc.mediaDevices as unknown as { getUserMedia: (c: unknown) => Promise<any> }
     ).getUserMedia({
-      video: useAndroidRecorderCapture()
+      video: isTrackRecorderCaptureEnabled()
         ? {
             facingMode: this.facingMode,
             width: WEBRTC_RECORDER_VIDEO_WIDTH,
@@ -294,7 +319,7 @@ class MediasoupClientService {
     this.localStream.removeTrack(oldTrack);
     this.localStream.addTrack(newTrack);
     attachProbe(newTrack);
-    if (useAndroidRecorderCapture()) {
+    if (isTrackRecorderCaptureEnabled()) {
       this.attachRecorderTap(newTrack);
     }
     logger.info('switchCamera done ' + this.facingMode);

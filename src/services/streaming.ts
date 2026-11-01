@@ -187,8 +187,8 @@ class StreamingService {
     this.isStoppingRecording = true;
     try {
       const res = await stopWebrtcRecorder(recId);
-      // Native diagnostics (frames/dropped/audio sync on iOS) — keep while the iOS port matures.
-      logger.info('WebRTC recorder result', res);
+      // Native diagnostics (frames/dropped/audio sync/segments); debug-only, silent in release.
+      logger.debug('WebRTC recorder result', res);
       this.activeWebrtcRecordingId = null;
       this.recordingDurationMs =
         res.durationMs > 0

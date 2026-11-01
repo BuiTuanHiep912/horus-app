@@ -253,10 +253,10 @@ export default function RemoteScreen() {
     setIsFullscreenPreview(false);
   }, [dbg]);
 
-  // M4: Trên Android có module webrtc-recorder (bật qua USE_WEBRTC_RECORDER_ON_ANDROID), ghi MP4
-  // full-quality trực tiếp từ raw frames của track WebRTC đang phát preview — preview giữ nguyên
-  // suốt lúc quay. Nhánh fallback expo-camera (dừng preview để quay) được giữ lại phía dưới cho
-  // iOS hoặc khi tắt cờ USE_WEBRTC_RECORDER_ON_ANDROID.
+  // M4: Android và iOS có module webrtc-recorder (bật qua USE_WEBRTC_RECORDER_ON_ANDROID / _ON_IOS),
+  // ghi MP4 full-quality trực tiếp từ raw frames của track WebRTC đang phát preview — preview giữ
+  // nguyên suốt lúc quay. Nhánh fallback expo-camera (dừng preview để quay) được giữ lại phía dưới
+  // khi tắt cờ hoặc build không có native module.
   // shortcut: CameraView unmount workaround khi bật preview vẫn giữ lại để nhánh fallback hoạt động.
   const resumePreviewRef = useRef(false);
   const startLocalRecording = useCallback(async () => {
@@ -267,7 +267,11 @@ export default function RemoteScreen() {
       if (mediasoupClientService.getLocalVideoTrack()) {
         const ok = await streamingService.startWebrtcTrackRecording();
         setIsRecording(ok);
-        dbg(ok ? 'Đang quay từ WebRTC track (preview giữ nguyên)' : 'Không bắt đầu quay WebRTC track được');
+        dbg(
+          ok
+            ? 'Đang quay từ WebRTC track (preview giữ nguyên)'
+            : 'Không bắt đầu quay WebRTC track được',
+        );
         return;
       }
       dbg('Chưa có track WebRTC — chuyển sang fallback expo-camera');
