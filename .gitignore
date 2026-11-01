@@ -30,3 +30,4 @@ expo-env.d.ts
 /android
 /build-android.log
 modules/*/android/build/
+/ios

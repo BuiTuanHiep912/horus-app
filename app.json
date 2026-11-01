@@ -50,10 +50,16 @@
       "package": "com.coder_vuitinh_2005.expocameratriggerapp"
     },
     "ios": {
-      "bundleIdentifier": "com.coder.vuitinh2005.expocameratriggerapp",
+      "bundleIdentifier": "com.buituanhiep912.horusapp",
+      "appleTeamId": "76RV26GUZQ",
       "infoPlist": {
         "NSCameraUsageDescription": "Cho phép ứng dụng truy cập camera để preview mediasoup.",
         "NSMicrophoneUsageDescription": "Cho phép ứng dụng truy cập micro để preview mediasoup.",
+        "NSLocalNetworkUsageDescription": "Cho phép ứng dụng kết nối tới server Multi-Cam trong mạng Wi-Fi.",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true,
+          "NSAllowsLocalNetworking": true
+        },
         "ITSAppUsesNonExemptEncryption": false
       }
     },
