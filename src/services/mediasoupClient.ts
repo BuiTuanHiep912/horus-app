@@ -7,6 +7,7 @@
 import { Platform } from 'react-native';
 import {
   USE_WEBRTC_RECORDER_ON_ANDROID,
+  USE_WEBRTC_RECORDER_ON_IOS,
   WEBRTC_PREVIEW_MAX_BITRATE,
   WEBRTC_PREVIEW_SCALE_DOWN_BY,
   WEBRTC_RECORDER_FPS,
@@ -26,8 +27,11 @@ import {
   stopProbe,
 } from './recorderProbe';
 
+// Name kept from the Android-only version; now also true on iOS (modules/webrtc-recorder/ios).
 const useAndroidRecorderCapture = () =>
-  Platform.OS === 'android' && USE_WEBRTC_RECORDER_ON_ANDROID && WebrtcRecorder != null;
+  ((Platform.OS === 'android' && USE_WEBRTC_RECORDER_ON_ANDROID) ||
+    (Platform.OS === 'ios' && USE_WEBRTC_RECORDER_ON_IOS)) &&
+  WebrtcRecorder != null;
 
 // Lazy import để web (không có react-native-webrtc) vẫn tsc được
 let webrtc: any | null = null;

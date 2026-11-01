@@ -15,6 +15,7 @@ import {
 import {
   CAMERA_VIDEO_MAX_DURATION,
   USE_WEBRTC_RECORDER_ON_ANDROID,
+  USE_WEBRTC_RECORDER_ON_IOS,
   WEBRTC_RECORDER_AUDIO_BITRATE,
   WEBRTC_RECORDER_FPS,
   WEBRTC_RECORDER_SEGMENT_SECONDS,
@@ -86,11 +87,11 @@ class StreamingService {
     return this.telemetry;
   }
 
-  /** True nếu có thể ghi trực tiếp từ track WebRTC trên Android (không cần dừng preview). */
+  /** True nếu có thể ghi trực tiếp từ track WebRTC trên Android/iOS (không cần dừng preview). */
   public canUseWebrtcTrackRecorder(): boolean {
     return (
-      Platform.OS === 'android' &&
-      USE_WEBRTC_RECORDER_ON_ANDROID &&
+      ((Platform.OS === 'android' && USE_WEBRTC_RECORDER_ON_ANDROID) ||
+        (Platform.OS === 'ios' && USE_WEBRTC_RECORDER_ON_IOS)) &&
       WebrtcRecorder != null
     );
   }
@@ -186,6 +187,8 @@ class StreamingService {
     this.isStoppingRecording = true;
     try {
       const res = await stopWebrtcRecorder(recId);
+      // Native diagnostics (frames/dropped/audio sync on iOS) — keep while the iOS port matures.
+      logger.info('WebRTC recorder result', res);
       this.activeWebrtcRecordingId = null;
       this.recordingDurationMs =
         res.durationMs > 0

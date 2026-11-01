@@ -14,6 +14,9 @@ export const CAMERA_VIDEO_MAX_FILE_SIZE = 1_000_000_000; // byte — dưới gi�
 // ghi MP4 full-quality từ raw frames, không cần dừng preview khi quay.
 // Đặt false để quay về nhánh fallback expo-camera (tạm dừng preview khi quay).
 export const USE_WEBRTC_RECORDER_ON_ANDROID = true;
+// iOS port (modules/webrtc-recorder/ios). M1: video only — clips recorded this way have no
+// audio until M2. Set false to fall back to expo-camera (stops the preview while recording).
+export const USE_WEBRTC_RECORDER_ON_IOS = true;
 export const WEBRTC_RECORDER_VIDEO_WIDTH = 1920;
 export const WEBRTC_RECORDER_VIDEO_HEIGHT = 1080;
 export const WEBRTC_RECORDER_FPS = 30;

@@ -13,7 +13,11 @@ const variant = RECORDER_PROBE_VARIANT;
 export const PROBE_ENCODINGS = [{ maxBitrate: 150_000, scaleResolutionDownBy: 4 }];
 
 export function isProbeActive(): boolean {
-  return Platform.OS === 'android' && variant !== 'off' && WebrtcRecorder != null;
+  return (
+    (Platform.OS === 'android' || Platform.OS === 'ios') &&
+    variant !== 'off' &&
+    WebrtcRecorder != null
+  );
 }
 
 export function probeVideoConstraints(facingMode: string) {
