@@ -20,6 +20,6 @@ Pod::Spec.new do |s|
   s.source_files = '**/*.{h,m,swift}'
   # Only the Foundation-only bridge header is public: it becomes part of the module's umbrella
   # header so Swift can see it, without leaking non-modular react-native-webrtc headers.
-  s.public_header_files = ['WRFrameProbe.h', 'WRTrackRecorder.h', 'WRAudioDevice.h']
+  s.public_header_files = ['WRFrameProbe.h', 'WRTrackRecorder.h', 'WRAudioDevice.h', 'WRStitcher.h']
   s.frameworks = 'AVFoundation', 'AudioToolbox', 'CoreMedia'
 end

@@ -98,11 +98,12 @@ public class WebrtcRecorderModule: Module {
       let fps = (opts["fps"] as? NSNumber)?.intValue ?? 30
       let bitrate = (opts["videoBitrate"] as? NSNumber)?.intValue ?? 6_000_000
       let audioBitrate = (opts["audioBitrate"] as? NSNumber)?.intValue ?? 128_000
+      let segmentSeconds = (opts["segmentSeconds"] as? NSNumber)?.intValue ?? 20
 
       WRFrameProbe.registerProcessor()
       let recorder = WRTrackRecorder(
         recordingId: recordingId, outputURL: fileURL, fps: fps, videoBitrate: bitrate,
-        audioBitrate: audioBitrate)
+        audioBitrate: audioBitrate, segmentSeconds: segmentSeconds)
       self.activeRecorder = recorder
       WRFrameProbe.setActiveRecorder(recorder)
       NSLog("[WebrtcRecorder] start %@ -> %@", recordingId, fileURL.path)
@@ -131,8 +132,22 @@ public class WebrtcRecorderModule: Module {
       }
     }
 
-    AsyncFunction("recoverOrphanedRecordings") { (_: String) -> [[String: Any]] in
-      []
+    // Stitches leftover `rec_*` segment folders (app killed mid-recording) into
+    // `recovered_rec_*.mp4` files; the folder of a recording in progress is skipped.
+    AsyncFunction("recoverOrphanedRecordings") { (rawDir: String, promise: Promise) in
+      let dir: URL
+      do {
+        dir = try Self.resolveOutputDir(rawDir)
+      } catch {
+        promise.resolve([[String: Any]]())
+        return
+      }
+      self.lock.lock()
+      let active = self.activeRecorder?.sessionDirectory
+      self.lock.unlock()
+      WRStitcher.recover(inDirectory: dir, excluding: active) { results in
+        promise.resolve(results)
+      }
     }
   }
 

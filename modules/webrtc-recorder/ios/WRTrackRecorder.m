@@ -1,68 +1,71 @@
 #import "WRTrackRecorder+Private.h"
+#import "WRSegmentWriter.h"
+#import "WRStitcher.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <WebRTC/WebRTC.h>
 
 static NSString *const kErrorDomain = @"WebrtcRecorder";
-static const double kAudioOutputSampleRate = 48000.0;
-// Audio buffers whose start is this close to the previous buffer's end are treated as contiguous,
-// absorbing host-clock jitter so AVAssetWriter never sees tiny overlaps.
-static const int64_t kAudioJoinToleranceNs = 2000000;  // 2 ms
+// After a rotation the previous segment stays open for audio that was captured before the boundary
+// but delivered after it; this caps how long we wait.
+static const int64_t kDrainTimeoutMs = 600;
+// A pause in camera frames longer than this (broadcast stopped and restarted while recording,
+// camera interrupted...) ends the segment at its last frame; the pause is cut from the timeline
+// instead of becoming a frozen picture that the audio track would not match.
+static const int64_t kFrameGapNs = 500 * NSEC_PER_MSEC;
 
 @implementation WRTrackRecorder {
   dispatch_queue_t _queue;
+  dispatch_group_t _finishing;
   NSInteger _fps;
   NSInteger _videoBitrate;
   NSInteger _audioBitrate;
+  int64_t _segmentNs;
+  NSURL *_sessionDir;
 
-  // Writer state — only touched on _queue.
-  AVAssetWriter *_writer;
-  AVAssetWriterInput *_videoInput;
-  AVAssetWriterInput *_audioInput;
-  AVAssetWriterInputPixelBufferAdaptor *_adaptor;
+  // Only touched on _queue.
+  WRSegmentWriter *_current;
+  WRSegmentWriter *_draining;
+  int64_t _drainLimitNs;
+  NSUInteger _drainGeneration;
+  NSMutableArray<WRSegmentWriter *> *_segments;
+  NSInteger _segmentIndex;
   BOOL _stopping;
   NSString *_failure;
-
-  // Video
-  int32_t _width;
-  int32_t _height;
-  int _rotation;
   int64_t _firstPtsNs;
   int64_t _lastPtsNs;
-  int64_t _frames;
-  int64_t _dropped;
-
-  // Audio
-  CMAudioFormatDescriptionRef _audioFormat;
-  double _audioFormatRate;
-  int64_t _firstAudioPtsNs;
-  int64_t _audioEndNs;
-  int64_t _audioFrames;
-  int64_t _audioDropped;
+  int64_t _rejectedFrames;  // non-camera or cropped buffers, never reached a segment
 }
 
 - (instancetype)initWithRecordingId:(NSString *)recordingId
                           outputURL:(NSURL *)outputURL
                                 fps:(NSInteger)fps
                        videoBitrate:(NSInteger)videoBitrate
-                       audioBitrate:(NSInteger)audioBitrate {
+                       audioBitrate:(NSInteger)audioBitrate
+                     segmentSeconds:(NSInteger)segmentSeconds {
   if ((self = [super init])) {
     _recordingId = [recordingId copy];
     _outputURL = [outputURL copy];
+    _sessionDir = [outputURL URLByDeletingPathExtension];
     _fps = fps > 0 ? fps : 30;
     _videoBitrate = videoBitrate > 0 ? videoBitrate : 6000000;
     _audioBitrate = audioBitrate > 0 ? audioBitrate : 128000;
+    _segmentNs = (segmentSeconds > 0 ? segmentSeconds : 20) * (int64_t)NSEC_PER_SEC;
     _queue = dispatch_queue_create("webrtc-recorder.writer", DISPATCH_QUEUE_SERIAL);
+    _finishing = dispatch_group_create();
+    _segments = [NSMutableArray array];
     _firstPtsNs = -1;
     _lastPtsNs = -1;
-    _firstAudioPtsNs = -1;
-    _audioEndNs = -1;
+    [[NSFileManager defaultManager] createDirectoryAtURL:_sessionDir
+                             withIntermediateDirectories:YES
+                                              attributes:nil
+                                                   error:nil];
   }
   return self;
 }
 
-- (void)dealloc {
-  if (_audioFormat != NULL) CFRelease(_audioFormat);
+- (NSURL *)sessionDirectory {
+  return _sessionDir;
 }
 
 #pragma mark - Video (capture queue -> writer queue)
@@ -76,10 +79,8 @@ static const int64_t kAudioJoinToleranceNs = 2000000;  // 2 ms
 
 - (void)writeFrame:(RTCVideoFrame *)frame {
   if (_stopping || _failure != nil) return;
-
   if (![frame.buffer isKindOfClass:[RTCCVPixelBuffer class]]) {
-    // Camera capturer always delivers CVPixelBuffers; anything else is unexpected.
-    _dropped++;
+    _rejectedFrames++;
     return;
   }
   RTCCVPixelBuffer *rtcBuffer = (RTCCVPixelBuffer *)frame.buffer;
@@ -87,41 +88,101 @@ static const int64_t kAudioJoinToleranceNs = 2000000;  // 2 ms
   int32_t w = (int32_t)CVPixelBufferGetWidth(pixelBuffer);
   int32_t h = (int32_t)CVPixelBufferGetHeight(pixelBuffer);
   if (rtcBuffer.cropWidth != w || rtcBuffer.cropHeight != h) {
-    // Cropped/adapted buffer: we only record full camera frames.
-    _dropped++;
+    _rejectedFrames++;  // cropped/adapted buffer: only full camera frames are recorded
     return;
   }
-
   int64_t ptsNs = frame.timeStampNs;
-
-  if (_writer == nil) {
-    if (![self setUpWriterWithWidth:w height:h rotation:(int)frame.rotation]) return;
-    // The first video frame defines t=0 of the file; earlier audio is trimmed.
-    [_writer startSessionAtSourceTime:CMTimeMake(ptsNs, NSEC_PER_SEC)];
-    _firstPtsNs = ptsNs;
-  }
-
-  if (w != _width || h != _height) {
-    // Size changed mid-recording (e.g. camera switch to another format): the encoder is fixed
-    // to the first size, so skip these frames.
-    _dropped++;
-    return;
-  }
   if (ptsNs <= _lastPtsNs) {
-    _dropped++;
+    _rejectedFrames++;
     return;
   }
-  if (!_videoInput.isReadyForMoreMediaData) {
-    _dropped++;
+  int rotation = (int)frame.rotation;
+
+  BOOL formatChanged = _current != nil &&
+                       (w != _current.width || h != _current.height || rotation != _current.rotation);
+  BOOL timeUp = _current != nil && ptsNs - _current.startNs >= _segmentNs;
+  BOOL resumedAfterGap =
+      _current != nil && _current.lastVideoNs >= 0 && ptsNs - _current.lastVideoNs > kFrameGapNs;
+  if (_current == nil || formatChanged || timeUp || resumedAfterGap) {
+    // Normally the old segment ends exactly where the new one starts (seamless join). After a
+    // gap it ends one frame after its last frame instead, so the gap is dropped when stitching.
+    int64_t endNs = resumedAfterGap ? _current.lastVideoNs + (int64_t)(NSEC_PER_SEC / _fps) : ptsNs;
+    if (![self rotateAtNs:ptsNs previousEndNs:endNs width:w height:h rotation:rotation]) return;
+    if (formatChanged) {
+      NSLog(@"[WebrtcRecorder] format changed -> %dx%d rot=%d, new segment", w, h, rotation);
+    }
+    if (resumedAfterGap) {
+      NSLog(@"[WebrtcRecorder] frames resumed after %.0f ms gap, gap cut", (ptsNs - endNs) / 1e6);
+    }
+  }
+
+  if ([_current appendPixelBuffer:pixelBuffer ptsNs:ptsNs]) {
+    if (_firstPtsNs < 0) _firstPtsNs = ptsNs;
+    _lastPtsNs = ptsNs;
+  }
+}
+
+/// Closes the current segment (it keeps draining audio up to `previousEndNs`) and opens the next
+/// one, whose session starts at `ptsNs`. Segments are stitched back to back, so anything between
+/// `previousEndNs` and `ptsNs` is not in the final file.
+- (BOOL)rotateAtNs:(int64_t)ptsNs
+     previousEndNs:(int64_t)previousEndNs
+             width:(int32_t)w
+            height:(int32_t)h
+          rotation:(int)rotation {
+  if (_current != nil) {
+    [self finishDraining];  // at most one draining segment at a time
+    _draining = _current;
+    _drainLimitNs = previousEndNs;
+    [_draining closeVideo];
+    NSUInteger generation = ++_drainGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kDrainTimeoutMs * NSEC_PER_MSEC), _queue, ^{
+      if (self->_drainGeneration == generation) [self finishDraining];
+    });
+  }
+
+  _segmentIndex++;
+  NSURL *url = [_sessionDir URLByAppendingPathComponent:
+                                [NSString stringWithFormat:@"segment_%04ld.mov", (long)_segmentIndex]];
+  NSString *error = nil;
+  _current = [WRSegmentWriter writerWithURL:url
+                                      width:w
+                                     height:h
+                                   rotation:rotation
+                                    startNs:ptsNs
+                                        fps:_fps
+                               videoBitrate:_videoBitrate
+                               audioBitrate:_audioBitrate
+                                      error:&error];
+  if (_current == nil) {
+    _failure = error ?: @"Cannot open segment";
+    NSLog(@"[WebrtcRecorder] %@", _failure);
+    return NO;
+  }
+  [_segments addObject:_current];
+  NSLog(@"[WebrtcRecorder] segment %ld started %dx%d rot=%d", (long)_segmentIndex, w, h, rotation);
+  return YES;
+}
+
+- (void)finishDraining {
+  WRSegmentWriter *segment = _draining;
+  if (segment == nil) return;
+  _draining = nil;
+  _drainGeneration++;
+  [self finishSegment:segment atNs:_drainLimitNs];
+}
+
+- (void)finishSegment:(WRSegmentWriter *)segment atNs:(int64_t)endNs {
+  if (segment.videoFrames == 0) {
+    [segment cancel];
     return;
   }
-  if (![_adaptor appendPixelBuffer:pixelBuffer withPresentationTime:CMTimeMake(ptsNs, NSEC_PER_SEC)]) {
-    _failure = _writer.error.localizedDescription ?: @"appendPixelBuffer failed";
-    NSLog(@"[WebrtcRecorder] video append failed: %@", _failure);
-    return;
-  }
-  _lastPtsNs = ptsNs;
-  _frames++;
+  dispatch_group_enter(_finishing);
+  [segment finishAtNs:endNs
+           completion:^(BOOL ok) {
+             if (!ok) NSLog(@"[WebrtcRecorder] segment %@ did not finalize", segment.url.lastPathComponent);
+             dispatch_group_leave(self->_finishing);
+           }];
 }
 
 #pragma mark - Audio (IO thread -> writer queue)
@@ -138,152 +199,19 @@ static const int64_t kAudioJoinToleranceNs = 2000000;  // 2 ms
 }
 
 - (void)writeAudio:(NSData *)pcm frames:(UInt32)frames sampleRate:(double)rate ptsNs:(int64_t)ptsNs {
-  // Nothing is written before the first video frame opens the session.
-  if (_writer == nil || _stopping || _failure != nil || rate <= 0) return;
+  if (_failure != nil || rate <= 0) return;
+  const int16_t *samples = (const int16_t *)pcm.bytes;
+  int64_t endNs = ptsNs + (int64_t)llround(frames * 1e9 / rate);
 
-  // Trim the part of this buffer that precedes the session start (first video frame).
-  UInt32 skip = 0;
-  if (ptsNs < _firstPtsNs) {
-    double skipped = ceil((double)(_firstPtsNs - ptsNs) * rate / 1e9);
-    if (skipped >= frames) return;
-    skip = (UInt32)skipped;
-    ptsNs += (int64_t)llround(skip * 1e9 / rate);
+  // Head of the buffer (before the boundary) belongs to the draining segment...
+  if (_draining != nil) {
+    [_draining appendPCM:samples frames:frames sampleRate:rate ptsNs:ptsNs limitNs:_drainLimitNs];
+    if (endNs >= _drainLimitNs) [self finishDraining];
   }
-  UInt32 count = frames - skip;
-
-  // Snap to the previous buffer's end when within jitter; drop genuine overlaps.
-  if (_audioEndNs >= 0) {
-    int64_t delta = ptsNs - _audioEndNs;
-    if (llabs(delta) <= kAudioJoinToleranceNs) {
-      ptsNs = _audioEndNs;
-    } else if (delta < 0) {
-      _audioDropped++;
-      return;
-    }
+  // ...the rest to the current one (it trims anything before its own start).
+  if (_current != nil && !_stopping) {
+    [_current appendPCM:samples frames:frames sampleRate:rate ptsNs:ptsNs limitNs:-1];
   }
-
-  if (![self ensureAudioFormatForRate:rate]) return;
-  if (!_audioInput.isReadyForMoreMediaData) {
-    _audioDropped++;
-    return;
-  }
-
-  size_t length = count * sizeof(int16_t);
-  CMBlockBufferRef block = NULL;
-  OSStatus status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, length, kCFAllocatorDefault,
-                                                       NULL, 0, length, kCMBlockBufferAssureMemoryNowFlag, &block);
-  if (status == noErr) {
-    status = CMBlockBufferReplaceDataBytes((const int16_t *)pcm.bytes + skip, block, 0, length);
-  }
-  CMSampleBufferRef sample = NULL;
-  if (status == noErr) {
-    status = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-        kCFAllocatorDefault, block, _audioFormat, count, CMTimeMake(ptsNs, NSEC_PER_SEC), NULL, &sample);
-  }
-  if (block != NULL) CFRelease(block);
-  if (status != noErr || sample == NULL) {
-    _audioDropped++;
-    return;
-  }
-
-  BOOL ok = [_audioInput appendSampleBuffer:sample];
-  CFRelease(sample);
-  if (!ok) {
-    _failure = _writer.error.localizedDescription ?: @"audio appendSampleBuffer failed";
-    NSLog(@"[WebrtcRecorder] audio append failed: %@", _failure);
-    return;
-  }
-  if (_firstAudioPtsNs < 0) _firstAudioPtsNs = ptsNs;
-  _audioEndNs = ptsNs + (int64_t)llround(count * 1e9 / rate);
-  _audioFrames += count;
-}
-
-- (BOOL)ensureAudioFormatForRate:(double)rate {
-  if (_audioFormat != NULL && _audioFormatRate == rate) return YES;
-  if (_audioFormat != NULL) {
-    CFRelease(_audioFormat);
-    _audioFormat = NULL;
-  }
-  AudioStreamBasicDescription asbd = {
-      .mSampleRate = rate,
-      .mFormatID = kAudioFormatLinearPCM,
-      .mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-      .mBytesPerPacket = 2,
-      .mFramesPerPacket = 1,
-      .mBytesPerFrame = 2,
-      .mChannelsPerFrame = 1,
-      .mBitsPerChannel = 16,
-  };
-  if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &_audioFormat) != noErr) {
-    _audioFormat = NULL;
-    return NO;
-  }
-  _audioFormatRate = rate;
-  return YES;
-}
-
-#pragma mark - Writer setup
-
-- (BOOL)setUpWriterWithWidth:(int32_t)width height:(int32_t)height rotation:(int)rotation {
-  [[NSFileManager defaultManager] removeItemAtURL:_outputURL error:nil];
-
-  NSError *error = nil;
-  _writer = [[AVAssetWriter alloc] initWithURL:_outputURL fileType:AVFileTypeMPEG4 error:&error];
-  if (_writer == nil) {
-    _failure = error.localizedDescription ?: @"Cannot create AVAssetWriter";
-    return NO;
-  }
-
-  NSDictionary *videoSettings = @{
-    AVVideoCodecKey : AVVideoCodecTypeH264,
-    AVVideoWidthKey : @(width),
-    AVVideoHeightKey : @(height),
-    AVVideoCompressionPropertiesKey : @{
-      AVVideoAverageBitRateKey : @(_videoBitrate),
-      AVVideoExpectedSourceFrameRateKey : @(_fps),
-      AVVideoMaxKeyFrameIntervalKey : @(_fps * 2),
-      AVVideoProfileLevelKey : AVVideoProfileLevelH264HighAutoLevel,
-    },
-  };
-  _videoInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
-  _videoInput.expectsMediaDataInRealTime = YES;
-  // Buffers come in sensor orientation; store the display rotation as the track transform
-  // (same idea as MediaMuxer.setOrientationHint on Android). Fixed at the first frame.
-  _videoInput.transform = CGAffineTransformMakeRotation((CGFloat)(rotation * M_PI / 180.0));
-
-  _adaptor = [[AVAssetWriterInputPixelBufferAdaptor alloc] initWithAssetWriterInput:_videoInput
-                                                         sourcePixelBufferAttributes:nil];
-  if (![_writer canAddInput:_videoInput]) {
-    _failure = @"Cannot add video input";
-    return NO;
-  }
-  [_writer addInput:_videoInput];
-
-  // AAC mono; AVAssetWriterInput resamples if the mic runs at another rate.
-  NSDictionary *audioSettings = @{
-    AVFormatIDKey : @(kAudioFormatMPEG4AAC),
-    AVSampleRateKey : @(kAudioOutputSampleRate),
-    AVNumberOfChannelsKey : @1,
-    AVEncoderBitRateKey : @(_audioBitrate),
-  };
-  _audioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
-  _audioInput.expectsMediaDataInRealTime = YES;
-  if ([_writer canAddInput:_audioInput]) {
-    [_writer addInput:_audioInput];
-  } else {
-    NSLog(@"[WebrtcRecorder] cannot add audio input — recording video only");
-    _audioInput = nil;
-  }
-
-  if (![_writer startWriting]) {
-    _failure = _writer.error.localizedDescription ?: @"startWriting failed";
-    return NO;
-  }
-  _width = width;
-  _height = height;
-  _rotation = rotation;
-  NSLog(@"[WebrtcRecorder] writer started %dx%d rot=%d -> %@", width, height, rotation, _outputURL.path);
-  return YES;
 }
 
 #pragma mark - Stop
@@ -291,50 +219,64 @@ static const int64_t kAudioJoinToleranceNs = 2000000;  // 2 ms
 - (void)stopWithCompletion:(void (^)(NSDictionary<NSString *, id> *_Nullable, NSError *_Nullable))completion {
   dispatch_async(_queue, ^{
     self->_stopping = YES;
-    AVAssetWriter *writer = self->_writer;
-
-    if (writer == nil || self->_frames == 0) {
-      [writer cancelWriting];
-      [[NSFileManager defaultManager] removeItemAtURL:self->_outputURL error:nil];
-      NSString *msg = self->_failure ?: @"No video frames were recorded";
-      completion(nil, [NSError errorWithDomain:kErrorDomain code:1 userInfo:@{NSLocalizedDescriptionKey : msg}]);
-      return;
+    [self finishDraining];
+    WRSegmentWriter *last = self->_current;
+    self->_current = nil;
+    if (last != nil) {
+      // Give the last frame its nominal duration so the file length matches what was filmed.
+      [self finishSegment:last atNs:last.lastVideoNs + (int64_t)(NSEC_PER_SEC / self->_fps)];
     }
 
-    [self->_videoInput markAsFinished];
-    [self->_audioInput markAsFinished];
-    // Video defines the file length; trailing audio past the last frame is cut.
-    [writer endSessionAtSourceTime:CMTimeMake(self->_lastPtsNs, NSEC_PER_SEC)];
-    [writer finishWritingWithCompletionHandler:^{
-      dispatch_async(self->_queue, ^{
-        if (writer.status != AVAssetWriterStatusCompleted) {
-          NSString *msg = writer.error.localizedDescription ?: @"finishWriting failed";
-          completion(nil, [NSError errorWithDomain:kErrorDomain code:2 userInfo:@{NSLocalizedDescriptionKey : msg}]);
-          return;
-        }
-        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:self->_outputURL.path error:nil];
-        double durationMs = (self->_lastPtsNs - self->_firstPtsNs) / 1e6;
-        double audioOffsetMs =
-            self->_firstAudioPtsNs >= 0 ? (self->_firstAudioPtsNs - self->_firstPtsNs) / 1e6 : -1;
-        NSDictionary *result = @{
-          @"uri" : self->_outputURL.absoluteString,
-          @"durationMs" : @(durationMs),
-          @"size" : @([attrs fileSize]),
-          @"frames" : @(self->_frames),
-          @"droppedFrames" : @(self->_dropped),
-          @"width" : @(self->_width),
-          @"height" : @(self->_height),
-          @"rotation" : @(self->_rotation),
-          @"audioFrames" : @(self->_audioFrames),
-          @"audioDroppedBuffers" : @(self->_audioDropped),
-          @"audioSampleRate" : @(self->_audioFormatRate),
-          @"audioStartOffsetMs" : @(audioOffsetMs),
-        };
-        NSLog(@"[WebrtcRecorder] finished %@", result);
-        completion(result, nil);
-      });
-    }];
+    dispatch_group_notify(self->_finishing, self->_queue, ^{
+      NSDictionary *diag = [self diagnostics];
+      if (self->_firstPtsNs < 0) {
+        [[NSFileManager defaultManager] removeItemAtURL:self->_sessionDir error:nil];
+        NSString *msg = self->_failure ?: @"No video frames were recorded";
+        completion(nil, [NSError errorWithDomain:kErrorDomain code:1 userInfo:@{NSLocalizedDescriptionKey : msg}]);
+        return;
+      }
+      [WRStitcher stitchSessionDir:self->_sessionDir
+                             toURL:self->_outputURL
+                        completion:^(NSDictionary *stitched, NSString *error) {
+                          if (stitched == nil) {
+                            // Segments stay on disk: the next launch recovers them.
+                            NSString *msg = [NSString stringWithFormat:@"Stitch failed: %@", error];
+                            completion(nil, [NSError errorWithDomain:kErrorDomain
+                                                                code:2
+                                                            userInfo:@{NSLocalizedDescriptionKey : msg}]);
+                            return;
+                          }
+                          NSMutableDictionary *result = [diag mutableCopy];
+                          [result addEntriesFromDictionary:stitched];
+                          NSLog(@"[WebrtcRecorder] finished %@", result);
+                          completion(result, nil);
+                        }];
+    });
   });
+}
+
+/// Totals across segments, for the JS log (`WebRTC recorder result`).
+- (NSDictionary<NSString *, id> *)diagnostics {
+  int64_t frames = 0, dropped = _rejectedFrames, audioFrames = 0, audioDropped = 0;
+  for (WRSegmentWriter *s in _segments) {
+    frames += s.videoFrames;
+    dropped += s.droppedVideo;
+    audioFrames += s.audioFrames;
+    audioDropped += s.droppedAudio;
+  }
+  WRSegmentWriter *first = _segments.firstObject;
+  double audioOffsetMs = first != nil && first.firstAudioNs >= 0 ? (first.firstAudioNs - first.startNs) / 1e6 : -1;
+  return @{
+    @"frames" : @(frames),
+    @"droppedFrames" : @(dropped),
+    @"audioFrames" : @(audioFrames),
+    @"audioDroppedBuffers" : @(audioDropped),
+    @"audioStartOffsetMs" : @(audioOffsetMs),
+    @"width" : @(first.width),
+    @"height" : @(first.height),
+    @"rotation" : @(first.rotation),
+    @"recordedSegments" : @(_segments.count),
+  };
 }
 
 @end
