@@ -13,16 +13,7 @@ export interface RoomCreateData {
   invite_code: string;
   expires_at: string;
   owner_device_id: string;
-  open_for_join: number;
   created_at: string;
-}
-
-export interface LanRoom {
-  room_id: string | null;
-  room_name: string | null;
-  invite_code: string;
-  auto_approve: number;
-  member_count?: number;
 }
 
 export interface RoomJoinData {
@@ -106,7 +97,6 @@ export interface MyRoom {
   room_id: string;
   room_name: string | null;
   invite_code: string;
-  open_for_join: number;
   auto_approve: number;
   status: 'open' | 'closed';
   member_count: number;
@@ -120,8 +110,6 @@ export async function createRoom(
     room_name?: string;
     max_members?: number;
     auto_approve?: 0 | 1;
-    /** 1 = hiển thị phòng trên LAN để phone khác join không cần mã mời */
-    open_for_join?: 0 | 1;
   } = {},
 ): Promise<RoomCreateData> {
   return apiRequest('/rooms', { method: 'POST', body: payload });

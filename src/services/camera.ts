@@ -1,17 +1,12 @@
 /**
  * Camera Service
- * Quản lý camera, chụp ảnh và mã hóa frame
+ * Quản lý camera, chụp ảnh và quay video
  */
 
 import { CameraView } from 'expo-camera';
+import * as FileSystem from 'expo-file-system/legacy';
 import { logger } from '../utils/logger';
-import { fileToBase64, getFileSize } from '../utils/file';
-import {
-  CAMERA_PHOTO_QUALITY,
-  CAMERA_PREVIEW_QUALITY,
-  MAX_FRAME_WIDTH,
-  MAX_FRAME_HEIGHT,
-} from '../constants/config';
+import { CAMERA_PHOTO_QUALITY, CAMERA_VIDEO_MAX_FILE_SIZE } from '../constants/config';
 
 export type CameraMode = 'picture' | 'video';
 
@@ -21,18 +16,9 @@ export interface PhotoAsset {
   height: number;
 }
 
-export interface CapturedFrame {
-  base64: string;
-  width: number;
-  height: number;
-}
-
 class CameraService {
   private cameraRef: CameraView | null = null;
   private isReady: boolean = false;
-  private isStreaming: boolean = false;
-  private frameIndex: number = 0;
-  private lastFrameTime: number = 0;
   private isRecordingVideo: boolean = false;
   private recordingPromise: Promise<{ uri: string } | undefined> | null = null;
   private recordingUri: string | null = null;
@@ -92,66 +78,6 @@ class CameraService {
   }
 
   /**
-   * Chuyển ảnh thành base64
-   */
-  public async photoToBase64(photoUri: string): Promise<string | null> {
-    try {
-      const base64 = await fileToBase64(photoUri);
-      if (!base64) {
-        logger.warn('Failed to convert photo to base64');
-        return null;
-      }
-
-      // Log file size for debugging
-      const fileSize = await getFileSize(photoUri);
-      logger.debug('Photo converted to base64', {
-        uri: photoUri,
-        base64Length: base64.length,
-        fileSizeBytes: fileSize,
-      });
-
-      return base64;
-    } catch (error) {
-      logger.error('Failed to convert photo to base64', error);
-      return null;
-    }
-  }
-
-  /**
-   * Chụp frame streaming trực tiếp trong bộ nhớ (base64: true)
-   * Không ghi file tạm và đọc lại như takePicture -> mượt hơn nhiều
-   */
-  public async captureFrame(
-    quality: number = CAMERA_PREVIEW_QUALITY,
-  ): Promise<CapturedFrame | null> {
-    if (!this.cameraRef) {
-      logger.warn('Cannot capture frame: camera not ready');
-      return null;
-    }
-
-    try {
-      const photo = await this.cameraRef.takePictureAsync({
-        base64: true,
-        quality,
-        shutterSound: false,
-      });
-
-      if (photo?.base64 && photo?.width && photo?.height) {
-        return {
-          base64: photo.base64,
-          width: photo.width,
-          height: photo.height,
-        };
-      }
-
-      return null;
-    } catch (error) {
-      logger.error('Failed to capture frame', error);
-      return null;
-    }
-  }
-
-  /**
    * Bắt đầu quay video thật bằng expo-camera recordAsync
    */
   public async startVideoRecording(maxDurationSec: number): Promise<boolean> {
@@ -170,6 +96,7 @@ class CameraService {
       try {
         this.recordingPromise = this.cameraRef.recordAsync({
           maxDuration: maxDurationSec,
+          maxFileSize: CAMERA_VIDEO_MAX_FILE_SIZE,
         });
 
         if (!this.recordingPromise) {
@@ -258,10 +185,8 @@ class CameraService {
       // Chờ file được flush xong trước khi trả uri (copyAsync sau đó nếu quá sớm
       // sẽ bắt được file cụt — chỉ 3s dù quay lâu hơn). Đợi ngắn + verify size.
       if (this.recordingUri) {
-        const fileSystem = (await import('expo-file-system')).default ?? await import('expo-file-system');
-        const fs = fileSystem as typeof import('expo-file-system');
         for (let i = 0; i < 5; i++) {
-          const info = await fs.getInfoAsync(this.recordingUri!);
+          const info = await FileSystem.getInfoAsync(this.recordingUri!);
           if (info.exists && (info as { size?: number }).size) break;
           await new Promise(resolve => setTimeout(resolve, 300));
         }
@@ -287,62 +212,6 @@ class CameraService {
     return this.isRecordingVideo;
   }
 
-  /**
-   * Bắt đầu streaming (theo dõi frame capture)
-   */
-  public startStreaming(): void {
-    this.isStreaming = true;
-    this.frameIndex = 0;
-    this.lastFrameTime = Date.now();
-    logger.info('Camera streaming started');
-  }
-
-  /**
-   * Dừng streaming
-   */
-  public stopStreaming(): void {
-    this.isStreaming = false;
-    logger.info('Camera streaming stopped');
-  }
-
-  /**
-   * Kiểm tra streaming có đang chạy không
-   */
-  public isStreaming_(): boolean {
-    return this.isStreaming;
-  }
-
-  /**
-   * Lấy frame index tiếp theo
-   */
-  public getNextFrameIndex(): number {
-    return ++this.frameIndex;
-  }
-
-  /**
-   * Cập nhật thời gian frame cuối cùng
-   */
-  public updateLastFrameTime(): void {
-    this.lastFrameTime = Date.now();
-  }
-
-  /**
-   * Lấy FPS hiện tại
-   */
-  public getCurrentFPS(): number {
-    if (this.frameIndex === 0) return 0;
-    const elapsed = Date.now() - this.lastFrameTime;
-    if (elapsed === 0) return 0;
-    return Math.round((1000 / elapsed) * 1000) / 1000;
-  }
-
-  /**
-   * Reset frame counter
-   */
-  public resetFrameCounter(): void {
-    this.frameIndex = 0;
-    this.lastFrameTime = Date.now();
-  }
 }
 
 // Export singleton instance

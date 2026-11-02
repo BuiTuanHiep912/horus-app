@@ -45,8 +45,7 @@
         "android.permission.READ_MEDIA_VIDEO",
         "android.permission.READ_MEDIA_AUDIO",
         "android.permission.INTERNET",
-        "android.permission.ACCESS_WIFI_STATE",
-        "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+        "android.permission.ACCESS_WIFI_STATE"
       ],
       "package": "com.coder_vuitinh_2005.expocameratriggerapp"
     },
@@ -62,9 +61,6 @@
       "bundler": "metro"
     },
     "extra": {
-      "wsHost": "192.168.1.6",
-      "wsPort": "3000",
-      "liveWsPort": "3333",
       "router": {},
       "eas": {
         "projectId": "1693b29b-9075-4384-9e43-671f6901bcf1"

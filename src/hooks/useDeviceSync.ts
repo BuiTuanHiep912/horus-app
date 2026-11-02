@@ -5,6 +5,7 @@
 import { useEffect } from 'react';
 import { AppState } from 'react-native';
 import { deviceSyncService } from '../services/deviceSync';
+import { streamingService } from '../services/streaming';
 import { logger } from '../utils/logger';
 import { authStore } from '../services/authStore';
 import { useRouter } from 'expo-router';
@@ -17,7 +18,7 @@ export function useDeviceSync(deviceId: string, opts?: { enabled?: boolean }) {
     if (!deviceId || !enabled) return;
 
     deviceSyncService.initialize(deviceId);
-    deviceSyncService.setTelemetryProvider(() => ({}));
+    deviceSyncService.setTelemetryProvider(() => streamingService.getTelemetry());
 
     const offCamera = deviceSyncService.onCommand('camera_config', async cmd => {
       const p = cmd.payload as { flash_mode?: string; zoom_factor?: number };

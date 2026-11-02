@@ -6,6 +6,9 @@
   "build": {
     "development": {
       "developmentClient": true,
+      "env": {
+        "API_URL": "https://api.example.com"
+      },
       "distribution": "internal",
       "android": {
         "buildType": "apk",
@@ -14,6 +17,9 @@
       }
     },
     "preview": {
+      "env": {
+        "API_URL": "https://api.example.com"
+      },
       "distribution": "internal",
       "android": {
         "buildType": "apk",
@@ -21,6 +27,9 @@
       }
     },
     "production": {
+      "env": {
+        "API_URL": "https://api.example.com"
+      },
       "autoIncrement": true
     }
   },

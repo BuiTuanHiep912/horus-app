@@ -2,8 +2,6 @@
  * Login Screen
  * Đăng nhập vào multicam-server (API v1). Sau khi đăng nhập thành công,
  * token được lưu ở AsyncStorage và router tự chuyển về tab chính.
- * Luồng LAN: quét server → thấy phòng chung → tap "Vào phòng" → đăng nhập
- * là Remote tự join phòng (không cần gõ mã mời).
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -28,7 +26,6 @@ import { getDeviceId } from '../src/utils/device';
 import { login } from '../src/api/auth';
 import { ApiError } from '../src/api/client';
 import { serverConfigService } from '../src/services/serverConfig';
-import { discoverServers, refreshRooms, DiscoveredServer } from '../src/services/discovery';
 import { logger } from '../src/utils/logger';
 
 export default function LoginScreen() {
@@ -36,97 +33,34 @@ export default function LoginScreen() {
   const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [host, setHost] = useState('');
-  const [port, setPort] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
   const [showServer, setShowServer] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [isScanning, setIsScanning] = useState(false);
-  const [foundServers, setFoundServers] = useState<DiscoveredServer[] | null>(null);
+  const [isTesting, setIsTesting] = useState(false);
   const [showDemos, setShowDemos] = useState(false);
 
   const passwordRef = useRef<TextInput>(null);
 
   useEffect(() => {
     serverConfigService.load().then(config => {
-      setHost(config.host);
-      setPort(config.port);
+      setBaseUrl(config.baseUrl);
+      if (!config.baseUrl) setShowServer(true);
     });
   }, []);
 
   const submittingRef = useRef(false);
-  // Danh sách server mới nhất (dùng cho poll phòng) — tránh closure cũ ghi đè
-  // kết quả khi người dùng bấm "Quét" lại trong lúc tick đang chạy.
-  const serversRef = useRef<DiscoveredServer[] | null>(null);
 
-  // Làm tươi danh sách phòng (phòng mới tạo sau scan sẽ hiện lên ngay).
-  // Đọc từ ref nên không bao giờ trả về kết quả cũ ghi đè một cuộc scan mới.
-  useEffect(() => {
-    const id = setInterval(async () => {
-      const current = serversRef.current;
-      if (!current || current.length === 0) return;
-      const updated = await refreshRooms(current).catch(() => current);
-      if (serversRef.current !== current) return; // đã có scan/pick mới — bỏ kết quả cũ
-      serversRef.current = updated;
-      setFoundServers(updated);
-    }, 6000);
-    return () => clearInterval(id);
-  }, []);
-
-  const handleScan = async () => {
-    if (isScanning) return;
-    setIsScanning(true);
-    setFoundServers(null);
-    serversRef.current = null;
+  const handleTest = async () => {
+    if (isTesting || !baseUrl.trim()) return;
+    setIsTesting(true);
     setError(null);
     setSuccess(null);
-    try {
-      const servers = await discoverServers(5000);
-      serversRef.current = servers.length ? servers : null;
-      setFoundServers(servers);
-      if (servers.length === 0) {
-        setError(
-          'Không tìm thấy server trên LAN. Kiểm tra cùng wifi / server đang chạy, hoặc nhập IP thủ công.',
-        );
-      }
-    } catch (err) {
-      logger.error('Scan failed', err);
-      setError('Quét lỗi — cần dev build có react-native-zeroconf.');
-    } finally {
-      setIsScanning(false);
-    }
-  };
-
-  const handlePickServer = (s: DiscoveredServer) => {
-    const ip = s.host || s.addresses[0] || '';
-    if (!ip) return;
-    setHost(ip);
-    setPort(String(s.port || 3000));
-    serverConfigService.clearLanRoom();
-    serversRef.current = null;
-    setFoundServers(null);
-    setError(null);
-    setSuccess(`Đã chọn server ${ip}:${s.port}. Bấm "Đăng nhập" để tiếp tục.`);
-  };
-
-  const handlePickRoom = async (s: DiscoveredServer, room: any) => {
-    const ip = s.host || s.addresses[0] || '';
-    if (!ip || !room?.invite_code) return;
-    setHost(ip);
-    setPort(String(s.port || 3000));
-    await serverConfigService.save(ip, String(s.port || 3000));
-    await serverConfigService.saveLanRoom({
-      room_id: room.room_id ?? null,
-      room_name: room.room_name ?? null,
-      invite_code: room.invite_code,
-      auto_approve: room.auto_approve ?? 1,
-    });
-    serversRef.current = null;
-    setFoundServers(null);
-    setError(null);
-    setSuccess(`Đã chọn phòng "${room.room_name || 'LAN'}". Đăng nhập là Remote để vào phòng.`);
-    setShowServer(false);
+    const ok = await serverConfigService.checkHealth(baseUrl);
+    if (ok) setSuccess('Server phản hồi tốt.');
+    else setError('Không kết nối được server. Kiểm tra URL và mạng.');
+    setIsTesting(false);
   };
 
   const handleSubmit = async () => {
@@ -135,8 +69,9 @@ export default function LoginScreen() {
       setError('Vui lòng nhập tài khoản và mật khẩu.');
       return;
     }
-    if (!host.trim() || !port.trim()) {
-      setError('Vui lòng nhập địa chỉ IP và port của server.');
+    if (!baseUrl.trim()) {
+      setError('Vui lòng nhập URL server (vd https://api.example.com).');
+      setShowServer(true);
       return;
     }
 
@@ -145,7 +80,7 @@ export default function LoginScreen() {
     setError(null);
 
     try {
-      await serverConfigService.save(host.trim(), port.trim());
+      await serverConfigService.save(baseUrl);
       const deviceId = await getDeviceId();
       const deviceInfo = getDeviceInfo();
       await login({
@@ -167,7 +102,7 @@ export default function LoginScreen() {
           ? err.code === 9995
             ? 'Số điện thoại/email hoặc mật khẩu không đúng.'
             : err.code === -1
-              ? 'Không kết nối được server. Kiểm tra lại IP/port phía dưới.'
+              ? 'Không kết nối được server. Kiểm tra lại URL server phía dưới.'
               : err.message
           : 'Đăng nhập thất bại. Vui lòng thử lại.';
       setError(message);
@@ -177,7 +112,7 @@ export default function LoginScreen() {
     }
   };
 
-  const serverTarget = host.trim() ? `${host.trim()}:${port.trim() || '?'}` : 'Chưa cấu hình';
+  const serverTarget = baseUrl.trim() || 'Chưa cấu hình';
 
   return (
     <SafeAreaView edges={['top', 'bottom']} style={styles.safe}>
@@ -278,120 +213,26 @@ export default function LoginScreen() {
 
             {showServer && (
               <View style={styles.serverBox}>
-                <View style={styles.serverRow}>
-                  <View style={styles.hostWrap}>
-                    <Text style={styles.label}>Địa chỉ IP server</Text>
-                    <TextInput
-                      style={styles.input}
-                      value={host}
-                      onChangeText={setHost}
-                      placeholder="VD: 192.168.1.101"
-                      placeholderTextColor={colors.textMuted}
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                      keyboardType="url"
-                      editable={!submitting}
-                    />
-                  </View>
-                  <View style={styles.portWrap}>
-                    <Text style={styles.label}>Port</Text>
-                    <TextInput
-                      style={styles.input}
-                      value={port}
-                      onChangeText={setPort}
-                      placeholder="3000"
-                      placeholderTextColor={colors.textMuted}
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                      keyboardType="number-pad"
-                      editable={!submitting}
-                    />
-                  </View>
-                </View>
-
+                <Text style={styles.label}>Server URL</Text>
+                <TextInput
+                  style={styles.input}
+                  value={baseUrl}
+                  onChangeText={setBaseUrl}
+                  placeholder="https://api.example.com"
+                  placeholderTextColor={colors.textMuted}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  keyboardType="url"
+                  editable={!submitting}
+                />
                 <TouchableOpacity
-                  style={[styles.scanButton, isScanning && styles.buttonDisabled]}
-                  onPress={handleScan}
-                  disabled={isScanning}>
-                  {isScanning ? (
-                    <View style={styles.scanButtonInner}>
-                      <ActivityIndicator color={colors.white} size="small" />
-                      <Text style={styles.scanButtonText}>Đang quét mạng…</Text>
-                    </View>
-                  ) : (
-                    <Text style={styles.scanButtonText}>🔎 Quét server & phòng LAN</Text>
-                  )}
-                </TouchableOpacity>
-
-                {isScanning && (
-                  <Text style={styles.scanNote}>
-                    Quét mDNS + rà subnet /24. Vài giây để có kết quả.
+                  style={[styles.testButton, isTesting && styles.buttonDisabled]}
+                  onPress={handleTest}
+                  disabled={isTesting}>
+                  <Text style={styles.testButtonText}>
+                    {isTesting ? 'Đang kiểm tra…' : '📡 Kiểm tra kết nối'}
                   </Text>
-                )}
-
-                {!isScanning && foundServers && foundServers.length === 0 && (
-                  <View style={styles.scanEmpty}>
-                    <Text style={styles.scanNoRoom}>
-                      Không có server nào. Bạn có thể nhập IP thủ công ở trên.
-                    </Text>
-                  </View>
-                )}
-
-                {foundServers && foundServers.length > 0 && (
-                  <View style={styles.scanResults}>
-                    {foundServers.map(s => {
-                      const ip = s.host || s.addresses[0] || '';
-                      const label = s.txt?.server_name || s.name || `${ip}:${s.port}`;
-                      const rooms = s.rooms || [];
-                      return (
-                        <View key={`${ip}:${s.port}`} style={styles.scanServerCard}>
-                          <TouchableOpacity
-                            style={styles.scanItem}
-                            onPress={() => handlePickServer(s)}
-                            activeOpacity={0.7}>
-                            <View style={styles.scanServerDot} />
-                            <View style={styles.flex}>
-                              <Text style={styles.scanItemName}>{label}</Text>
-                              <Text style={styles.scanItemSub}>
-                                {ip}:{s.port}
-                              </Text>
-                            </View>
-                            <Text style={styles.scanItemPick}>Chọn ›</Text>
-                          </TouchableOpacity>
-
-                          {rooms.map(r => (
-                            <TouchableOpacity
-                              key={r.room_id ?? r.invite_code}
-                              style={styles.scanRoomItem}
-                              onPress={() => handlePickRoom(s, r)}
-                              activeOpacity={0.7}>
-                              <View style={styles.flex}>
-                                <Text style={styles.scanRoomName}>
-                                  📡 {r.room_name || 'Phòng LAN'}
-                                </Text>
-                                <Text style={styles.scanRoomSub}>
-                                  {r.auto_approve === 0
-                                    ? 'Cần Controller duyệt'
-                                    : 'Tự động vào phòng'}{' '}
-                                  · {r.member_count ?? 0} thiết bị · mã {r.invite_code}
-                                </Text>
-                              </View>
-                              <Text style={styles.scanItemPick}>Vào phòng ›</Text>
-                            </TouchableOpacity>
-                          ))}
-                          {rooms.length === 0 && (
-                            <Text style={styles.scanNoRoom}>
-                              Không có phòng nào đang mở trên LAN
-                            </Text>
-                          )}
-                        </View>
-                      );
-                    })}
-                    <Text style={styles.scanNote}>
-                      Tap {'"Vào phòng"'} → đăng nhập là Remote tự vào phòng, không cần gõ mã mời.
-                    </Text>
-                  </View>
-                )}
+                </TouchableOpacity>
               </View>
             )}
 
@@ -583,104 +424,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.border,
   },
-  serverRow: {
-    flexDirection: 'row',
-    gap: spacing.sm,
-  },
-  hostWrap: {
-    flex: 2,
-  },
-  portWrap: {
-    flex: 1,
-  },
-  scanButton: {
+  testButton: {
     backgroundColor: colors.primary,
     borderRadius: radius.sm,
     paddingVertical: 12,
     alignItems: 'center',
     marginTop: spacing.md,
   },
-  scanButtonInner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-  },
-  scanButtonText: {
+  testButtonText: {
     color: colors.white,
     fontSize: 15,
     fontWeight: '600',
-  },
-  scanNote: {
-    fontSize: 12,
-    color: colors.textMuted,
-    textAlign: 'center',
-    marginTop: spacing.sm,
-    lineHeight: 16,
-  },
-  scanEmpty: {
-    marginTop: spacing.sm,
-  },
-  scanResults: {
-    gap: spacing.sm,
-    marginTop: spacing.md,
-  },
-  scanServerCard: {
-    backgroundColor: colors.surface,
-    borderRadius: radius.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.sm,
-    gap: spacing.xs,
-  },
-  scanItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-  },
-  scanServerDot: {
-    width: 8,
-    height: 8,
-    borderRadius: radius.round,
-    backgroundColor: colors.success,
-  },
-  scanItemName: {
-    fontSize: 15,
-    color: colors.text,
-    fontWeight: '600',
-  },
-  scanItemSub: {
-    fontSize: 12,
-    color: colors.textMuted,
-  },
-  scanItemPick: {
-    color: colors.primary,
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  scanRoomItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-    backgroundColor: colors.background,
-    borderRadius: radius.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.sm,
-  },
-  scanRoomName: {
-    fontSize: 14,
-    color: colors.text,
-    fontWeight: '600',
-  },
-  scanRoomSub: {
-    fontSize: 12,
-    color: colors.textMuted,
-    marginTop: 2,
-  },
-  scanNoRoom: {
-    fontSize: 12,
-    color: colors.textMuted,
-    fontStyle: 'italic',
   },
   button: {
     backgroundColor: colors.primary,

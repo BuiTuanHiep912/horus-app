@@ -1,0 +1,20 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.webrtcrecorder'
+version = '0.1.0'
+
+android {
+  namespace "expo.modules.webrtcrecorder"
+  defaultConfig {
+    versionCode 1
+    versionName "0.1.0"
+  }
+}
+
+dependencies {
+  // Frame-processor registry (com.oney.WebRTCModule.videoEffects) + org.webrtc (exposed as `api`).
+  implementation project(':react-native-webrtc')
+}

@@ -4,7 +4,7 @@
  * duy trì index trong AsyncStorage, và hỗ trợ chuyển (copy) file ra thư viện ảnh Photos.
  */
 
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { logger } from '../utils/logger';

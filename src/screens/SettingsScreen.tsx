@@ -1,7 +1,7 @@
 /**
  * Settings Screen
- * Cho phép nhập địa chỉ IP/port của server ngay trong app (lưu AsyncStorage),
- * không cần sửa app.json mỗi lần. Hỗ trợ kiểm tra kết nối tới server.
+ * Cho phép nhập URL server ngay trong app (lưu AsyncStorage),
+ * không cần build lại. Hỗ trợ kiểm tra kết nối tới server (/health).
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -26,26 +26,21 @@ import { logout } from '../api/auth';
 import { getDeviceId } from '../utils/device';
 import { logger } from '../utils/logger';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { discoverServers, DiscoveredServer } from '../services/discovery';
 
 export default function SettingsScreen() {
-  const [host, setHost] = useState('');
-  const [port, setPort] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
   const [deviceId, setDeviceId] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [isScanning, setIsScanning] = useState(false);
-  const [foundServers, setFoundServers] = useState<DiscoveredServer[] | null>(null);
   const [account, setAccount] = useState<{ name: string; role: string; phone: string } | null>(
     null,
   );
 
   useEffect(() => {
     serverConfigService.load().then(config => {
-      setHost(config.host);
-      setPort(config.port);
+      setBaseUrl(config.baseUrl);
       setIsLoading(false);
     });
     getDeviceId().then(setDeviceId);
@@ -92,95 +87,31 @@ export default function SettingsScreen() {
   },[]);
 
   const handleSave = useCallback(async () => {
-    const trimmedHost = host.trim();
-    const trimmedPort = port.trim();
-
-    if (!trimmedHost) {
-      Alert.alert('Lỗi', 'Vui lòng nhập địa chỉ IP của máy chạy server.');
-      return;
-    }
-
-    const portNumber = parseInt(trimmedPort, 10);
-    if (!trimmedPort || Number.isNaN(portNumber) || portNumber < 1 || portNumber > 65535) {
-      Alert.alert('Lỗi', 'Port không hợp lệ (1-65535).');
+    if (!baseUrl.trim()) {
+      Alert.alert('Lỗi', 'Vui lòng nhập URL server (vd https://api.example.com).');
       return;
     }
 
     setIsSaving(true);
-    await serverConfigService.save(trimmedHost, trimmedPort);
+    const saved = await serverConfigService.save(baseUrl);
+    setBaseUrl(saved.baseUrl);
     setIsSaving(false);
     setTestResult(null);
-    Alert.alert('Đã lưu', 'Cấu hình đã lưu. Tab Camera sẽ tự động kết nối lại.');
-  }, [host, port]);
+    Alert.alert('Đã lưu', 'Cấu hình đã lưu.');
+  }, [baseUrl]);
 
   const handleTest = useCallback(async () => {
-    const trimmedHost = host.trim();
-    const trimmedPort = port.trim();
-    if (!trimmedHost || !trimmedPort) {
-      Alert.alert('Lỗi', 'Vui lòng nhập host và port trước khi kiểm tra.');
+    if (!baseUrl.trim()) {
+      Alert.alert('Lỗi', 'Vui lòng nhập URL server trước khi kiểm tra.');
       return;
     }
 
     setIsTesting(true);
     setTestResult(null);
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-
-    try {
-      const url = `http://${trimmedHost}:${trimmedPort}/health`;
-      const response = await fetch(url, { signal: controller.signal });
-      if (response.ok) {
-        const body = await response.json().catch(() => null);
-        setTestResult(body?.data?.status === 'up' ? 'success' : 'fail');
-      } else {
-        setTestResult('fail');
-      }
-    } catch (error) {
-      logger.warn('Connection test failed', error);
-      setTestResult('fail');
-    } finally {
-      clearTimeout(timeout);
-      setIsTesting(false);
-    }
-  }, [host, port]);
-
-  const handleScan = useCallback(async () => {
-    setIsScanning(true);
-    setFoundServers(null);
-    setTestResult(null);
-    try {
-      const servers = await discoverServers(5000);
-      setFoundServers(servers);
-      if (servers.length === 0) {
-        Alert.alert(
-          'Không tìm thấy server',
-          'Không thấy server Multicam nào trên mạng LAN. Kiểm tra:\n' +
-            '• Điện thoại và máy chạy server cùng 1 wifi\n' +
-            '• Server đang chạy (discovery mDNS + UDP 55666)\n' +
-            '• Hoặc nhập IP/port thủ công bên dưới.',
-        );
-      }
-    } catch (err) {
-      logger.error('Scan failed', err);
-      Alert.alert('Quét lỗi', 'Không thực hiện được quét mạng (cần dev build có react-native-zeroconf).');
-    } finally {
-      setIsScanning(false);
-    }
-  }, []);
-
-  const handlePickServer = useCallback(
-    (s: DiscoveredServer) => {
-      const ip = s.host || s.addresses[0] || '';
-      const port = String(s.port || 3000);
-      if (!ip) return;
-      setHost(ip);
-      setPort(port);
-      setFoundServers(null);
-      Alert.alert('Đã chọn server', `${ip}:${port} (${s.txt?.server_name || s.name}) — bấm 💾 Lưu để áp dụng.`);
-    },
-    [],
-  );
+    const ok = await serverConfigService.checkHealth(baseUrl);
+    setTestResult(ok ? 'success' : 'fail');
+    setIsTesting(false);
+  }, [baseUrl]);
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -202,34 +133,17 @@ export default function SettingsScreen() {
           <>
             <View style={styles.card}>
               <Text style={styles.cardTitle}>🖥️ Server</Text>
-              <View style={styles.row}>
-                <View style={{ flex: 2 }}>
-                  <Text style={styles.label}>IP</Text>
-                  <TextInput
-                    style={styles.input}
-                    value={host}
-                    onChangeText={setHost}
-                    placeholder="192.168.1.6"
-                    placeholderTextColor={colors.textMuted}
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    keyboardType="url"
-                  />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.label}>Port</Text>
-                  <TextInput
-                    style={styles.input}
-                    value={port}
-                    onChangeText={setPort}
-                    placeholder="3000"
-                    placeholderTextColor={colors.textMuted}
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    keyboardType="number-pad"
-                  />
-                </View>
-              </View>
+              <Text style={styles.label}>Server URL</Text>
+              <TextInput
+                style={styles.input}
+                value={baseUrl}
+                onChangeText={setBaseUrl}
+                placeholder="https://api.example.com"
+                placeholderTextColor={colors.textMuted}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="url"
+              />
 
               <View style={styles.row}>
                 <TouchableOpacity
@@ -246,32 +160,6 @@ export default function SettingsScreen() {
                 </TouchableOpacity>
               </View>
 
-              <TouchableOpacity
-                style={[styles.button, styles.scanButton, isScanning && styles.buttonDisabled]}
-                onPress={handleScan}
-                disabled={isScanning}>
-                <Text style={styles.scanButtonText}>{isScanning ? 'Đang quét mạng...' : '🔎 Quét server (mDNS)'}</Text>
-              </TouchableOpacity>
-
-              {foundServers && foundServers.length > 0 && (
-                <View style={styles.scanResults}>
-                  {foundServers.map(s => {
-                    const ip = s.host || s.addresses[0] || '';
-                    const label = s.txt?.server_name || s.name || `${ip}:${s.port}`;
-                    return (
-                      <TouchableOpacity key={`${ip}:${s.port}`} style={styles.scanItem} onPress={() => handlePickServer(s)}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.scanItemName}>{label}</Text>
-                          <Text style={styles.scanItemSub}>{ip}:{s.port}</Text>
-                        </View>
-                        <Text style={styles.scanItemPick}>Chọn ›</Text>
-                      </TouchableOpacity>
-                    );
-                  })}
-                  <Text style={styles.scanNote}>Tap một server để điền IP/Port, sau đó bấm 💾 Lưu.</Text>
-                </View>
-              )}
-
               {testResult && (
                 <View
                   style={[
@@ -285,7 +173,7 @@ export default function SettingsScreen() {
                     ]}>
                     {testResult === 'success'
                       ? '✓ Server phản hồi tốt'
-                      : '✕ Không kết nối được tới server. Kiểm tra IP, port và firewall.'}
+                      : '✕ Không kết nối được tới server. Kiểm tra URL và mạng.'}
                   </Text>
                 </View>
               )}
@@ -376,49 +264,6 @@ const styles = StyleSheet.create({
   },
   testFailText: {
     color: colors.dangerDark,
-  },
-  scanButton: {
-    backgroundColor: colors.primaryLight,
-    marginTop: spacing.sm,
-  },
-  scanButtonText: {
-    color: colors.primaryDark,
-    fontSize: 14,
-    fontWeight: 'bold',
-  },
-  scanResults: {
-    marginTop: spacing.md,
-    gap: spacing.sm,
-  },
-  scanItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.background,
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  scanItemName: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: colors.text,
-  },
-  scanItemSub: {
-    fontSize: 12,
-    color: colors.textSecondary,
-    fontFamily: 'monospace',
-    marginTop: 2,
-  },
-  scanItemPick: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: colors.primary,
-  },
-  scanNote: {
-    fontSize: 11,
-    color: colors.textMuted,
   },
   infoCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.md, shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 8, shadowOffset: { width: 0, height: 2 }, elevation: 1 },
   infoCardHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },

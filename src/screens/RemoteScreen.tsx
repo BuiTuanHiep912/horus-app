@@ -24,19 +24,15 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useRouter } from 'expo-router';
 
 import { logger } from '../utils/logger';
-import { wsService } from '../services/websocket';
 import { cameraService } from '../services/camera';
 import { streamingService } from '../services/streaming';
 import { localStore } from '../services/localStore';
 import { getDeviceId } from '../utils/device';
 import { getDeviceInfo } from '../services/deviceInfo';
-import { serverConfigService, ServerConfig, LanRoom } from '../services/serverConfig';
-import { fetchLanRooms } from '../services/discovery';
 import { colors, spacing, radius } from '../constants/theme';
-import { ENABLE_SOCKET } from '../constants/config';
 import { useDeviceSync } from '../hooks/useDeviceSync';
 import { useAuthSession } from '../hooks/useAuthSession';
-import { mediasoupClientService } from '../services/mediasoupClient';
+import { mediasoupClientService, type PreviewState } from '../services/mediasoupClient';
 import { deviceSyncService } from '../services/deviceSync';
 import { joinRoom, leaveRoom } from '../api/rooms';
 import { ApiError } from '../api/client';
@@ -49,26 +45,23 @@ export default function RemoteScreen() {
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [photoUri, setPhotoUri] = useState<string | null>(null);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [wsConnected, setWsConnected] = useState(!ENABLE_SOCKET);
-  const [streamingStats, setStreamingStats] = useState<any>(null);
   const [deviceId, setDeviceId] = useState<string>('');
   const [isSaving, setIsSaving] = useState(false);
-  const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
   const [isPreviewing, setIsPreviewing] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [uploadPercent, setUploadPercent] = useState<number | null>(null);
   const [roomIdForPreview, setRoomIdForPreview] = useState<string | null>(null);
   const [joinPending, setJoinPending] = useState(false);
   const [inviteInput, setInviteInput] = useState('');
-  const [openRooms, setOpenRooms] = useState<LanRoom[] | null>(null);
-  const [roomsLoading, setRoomsLoading] = useState(false);
   const [joinLog, setJoinLog] = useState<string[]>([]);
   const [dbgLog, setDbgLog] = useState<string[]>([]);
-  const [showDbg, setShowDbg] = useState(true);
+  const [showDbg, setShowDbg] = useState(false);
   const [localWrtcStream, setLocalWrtcStream] = useState<any>(null);
   const [rtcKey, setRtcKey] = useState(0);
   const [RTCViewComp, setRTCViewComp] = useState<any>(null);
   const [isFullscreenPreview, setIsFullscreenPreview] = useState(false);
   const [showTopBar, setShowTopBar] = useState(true);
+  const [previewState, setPreviewState] = useState<PreviewState>('idle');
   useEffect(() => {
     if (isPreviewing && !RTCViewComp) {
       import('react-native-webrtc')
@@ -92,24 +85,19 @@ export default function RemoteScreen() {
   useEffect(() => {
     dbgScrollRef.current?.scrollToEnd({ animated: true });
   }, [dbgLog]);
+  useEffect(
+    () =>
+      mediasoupClientService.subscribe((st, detail) => {
+        setPreviewState(st);
+        if (st !== 'idle') dbg(`preview ${st}${detail ? ` (${detail})` : ''}`);
+      }),
+    [dbg],
+  );
 
   const cameraRef = useRef<CameraView | null>(null);
 
-  // Refs giữ handler mới nhất để WebSocket handler (đăng ký 1 lần) không bị stale closure
-  const handleStartStreamingRef = useRef<() => void>(() => {});
-  const handleStopStreamingRef = useRef<() => void>(() => {});
-
   // Tạo unique device ID (cố định, được lưu trong AsyncStorage)
   const deviceName = useRef(`Remote Device`);
-
-  // Nạp cấu hình server từ AsyncStorage + lắng nghe thay đổi từ Settings tab
-  useEffect(() => {
-    serverConfigService.load().then(setServerConfig);
-    return serverConfigService.subscribe(setServerConfig);
-  }, []);
-
-  const wsUrl = serverConfig ? serverConfigService.liveWsUrl(serverConfig) : '';
-  const apiWsUrl = serverConfig ? serverConfigService.wsUrl(serverConfig) : '';
 
   // Nạp deviceId cố định
   useEffect(() => {
@@ -121,41 +109,7 @@ export default function RemoteScreen() {
   const isRemote = session?.accountRole === 'remote';
   useDeviceSync(deviceId, { enabled: !!deviceId && !!session && isRemote });
 
-  // Auto-join phòng LAN đã chọn ở màn đăng nhập — remote không cần gõ mã mời
-  const autoJoinedRef = useRef(false);
-  useEffect(() => {
-    if (!deviceId || !session || roomIdForPreview || autoJoinedRef.current) return;
-    let cancelled = false;
-    (async () => {
-      const lanRoom = await serverConfigService.loadLanRoom();
-      if (cancelled || autoJoinedRef.current || !lanRoom?.invite_code) return;
-      autoJoinedRef.current = true;
-      try {
-        dbg(`Auto-join phòng LAN "${lanRoom.room_name || lanRoom.invite_code}"`);
-        const r = await joinRoom({
-          invite_code: lanRoom.invite_code,
-          device_id: deviceId,
-          camera_name: 'Remote-' + deviceId.slice(-4),
-          grant_control: true,
-        });
-        setRoomIdForPreview(r.room_id);
-        const pending = r.member_join_status === 'pending';
-        setJoinPending(pending);
-        if (pending) dbg('Auto-join: đang chờ Controller duyệt');
-        else dbg(`Auto-join OK room=${r.room_id.slice(0, 6)}`);
-      } catch (e: any) {
-        autoJoinedRef.current = false;
-        dbg(`Auto-join thất bại: ${String(e?.message || e)}`);
-        serverConfigService.clearLanRoom();
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deviceId, session, roomIdForPreview]);
-
-  // Join phòng (dùng chung cho nút Join mã mời và danh sách phòng LAN)
+  // Join phòng bằng mã mời
   const doJoin = useCallback(
     async (code: string, roomName: string | null) => {
       if (!deviceId) return;
@@ -165,12 +119,6 @@ export default function RemoteScreen() {
           device_id: deviceId,
           camera_name: 'Remote-' + deviceId.slice(-4),
           grant_control: true,
-        });
-        await serverConfigService.saveLanRoom({
-          room_id: r.room_id,
-          room_name: roomName,
-          invite_code: code,
-          auto_approve: 1,
         });
         setRoomIdForPreview(r.room_id);
         const pending = r.member_join_status === 'pending';
@@ -211,27 +159,6 @@ export default function RemoteScreen() {
     },
     [deviceId, dbg, roomIdForPreview],
   );
-
-  // Tải danh sách phòng đang mở trên LAN (GET /rooms/discover) từ server đã cấu hình
-  const loadOpenRooms = useCallback(async () => {
-    if (!serverConfig) return;
-    setRoomsLoading(true);
-    try {
-      const rooms = await fetchLanRooms(
-        serverConfig.host,
-        Number(serverConfig.port) || 3000,
-        {},
-        3000,
-      );
-      setOpenRooms(rooms ?? []);
-      if (rooms && rooms.length === 0) dbg('Không có phòng nào đang mở trên LAN');
-    } catch (err: any) {
-      dbg('Lỗi tải phòng LAN: ' + String(err?.message || err));
-      setOpenRooms([]);
-    } finally {
-      setRoomsLoading(false);
-    }
-  }, [serverConfig, dbg]);
 
   // Log insets ngay khi mount để debug Samsung đè bar
   useEffect(() => {
@@ -285,6 +212,10 @@ export default function RemoteScreen() {
       dbg('startBroadcast: chưa ở trong phòng, bỏ qua');
       return;
     }
+    if (cameraService.isVideoRecording_()) {
+      dbg('Đang quay local — preview tạm dừng tới khi dừng quay');
+      return;
+    }
     // Chặn kích hoạt trùng (Controller bấm "Ghi ALL" 2 lần trong cùng 1 nhịp → 2 lệnh
     // start_record về sát nhau). state isPreviewing chưa kịp cập nhật trong cùng tick,
     // nên dùng ref để loại bỏ gọi trùng — tránh create 2 bộ producer (nhiều preview +
@@ -296,6 +227,8 @@ export default function RemoteScreen() {
     // tranh cùng 1 camera → preview trên phone không mở được ("Đang mở camera WebRTC..."
     // treo mãi) — đúng lúc Controller bật preview/Ghi ALL. Chờ 1 nhịp cho React commit
     // + expo-camera nhả camera, rồi mới getUserMedia.
+    cameraService.setReady(false);
+    setIsCameraReady(false);
     setIsPreviewing(true);
     try {
       await new Promise(r => setTimeout(r, 400));
@@ -319,15 +252,75 @@ export default function RemoteScreen() {
     }
   }, [isPreviewing, roomIdForPreview, dbg]);
 
-  // Dừng phát sóng — server tự finalize file MP4 (recorder) và lưu vào Videos
+  // Dừng phát sóng (preview only — server không ghi hình)
   const stopBroadcast = useCallback(async () => {
-    dbg('Ngắt preview → server lưu broadcast');
+    dbg('Ngắt preview');
     deactivateKeepAwake('broadcast');
     mediasoupClientService.disconnect();
     setLocalWrtcStream(null);
     setIsPreviewing(false);
     setIsFullscreenPreview(false);
   }, [dbg]);
+
+  // M4: Trên Android có module webrtc-recorder (bật qua USE_WEBRTC_RECORDER_ON_ANDROID), ghi MP4
+  // full-quality trực tiếp từ raw frames của track WebRTC đang phát preview — preview giữ nguyên
+  // suốt lúc quay. Nhánh fallback expo-camera (dừng preview để quay) được giữ lại phía dưới cho
+  // iOS hoặc khi tắt cờ USE_WEBRTC_RECORDER_ON_ANDROID.
+  // shortcut: CameraView unmount workaround khi bật preview vẫn giữ lại để nhánh fallback hoạt động.
+  const resumePreviewRef = useRef(false);
+  const startLocalRecording = useCallback(async () => {
+    if (streamingService.canUseWebrtcTrackRecorder()) {
+      if (!isPreviewing && roomIdForPreview && !joinPending) {
+        await startBroadcast();
+      }
+      if (mediasoupClientService.getLocalVideoTrack()) {
+        const ok = await streamingService.startWebrtcTrackRecording();
+        setIsRecording(ok);
+        dbg(ok ? 'Đang quay từ WebRTC track (preview giữ nguyên)' : 'Không bắt đầu quay WebRTC track được');
+        return;
+      }
+      dbg('Chưa có track WebRTC — chuyển sang fallback expo-camera');
+    }
+    resumePreviewRef.current = isPreviewing;
+    if (isPreviewing) await stopBroadcast();
+    // Chờ CameraView mount lại và bắn onCameraReady (tối đa ~5s)
+    for (let i = 0; i < 25 && !cameraService.isReady_(); i++) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+    const ok = await streamingService.startRecording();
+    setIsRecording(ok);
+    dbg(ok ? 'Đang quay local' : 'Không bắt đầu quay local được');
+  }, [isPreviewing, roomIdForPreview, joinPending, startBroadcast, stopBroadcast, dbg]);
+
+  const stopLocalRecording = useCallback(async () => {
+    if (streamingService.isWebrtcTrackRecording()) {
+      const uri = await streamingService.stopWebrtcTrackRecording();
+      setIsRecording(false);
+      if (uri) {
+        setUploadPercent(0);
+        streamingService.uploadRecording(uri, setUploadPercent).then(ok => {
+          dbg(ok ? 'Upload xong' : 'Upload lỗi — clip vẫn nằm ở tab Files');
+          setUploadPercent(null);
+        });
+      }
+      return;
+    }
+    if (cameraService.isVideoRecording_()) {
+      const uri = await streamingService.stopRecording();
+      setIsRecording(false);
+      if (uri) {
+        setUploadPercent(0);
+        streamingService.uploadRecording(uri, setUploadPercent).then(ok => {
+          dbg(ok ? 'Upload xong' : 'Upload lỗi — clip vẫn nằm ở tab Files');
+          setUploadPercent(null);
+        });
+      }
+    }
+    if (resumePreviewRef.current) {
+      resumePreviewRef.current = false;
+      await startBroadcast();
+    }
+  }, [startBroadcast, dbg]);
 
   // Lệnh từ Controller: được duyệt / bị kick / kích hoạt & dừng GHI (điều khiển nhiều app cùng lúc)
   useEffect(() => {
@@ -344,43 +337,21 @@ export default function RemoteScreen() {
       setJoinPending(false);
       setRoomIdForPreview(null);
     });
-    // Controller bấm "Ghi ALL" → mọi Remote online có grant_control nhận start_record → tự phát sóng
+    // Controller bấm "Ghi ALL" → mọi Remote online có grant_control nhận start_record → quay local
     //   + lưu session_id từ lệnh (để gom cùng folder trên MinIO khi upload)
     const offStart = deviceSyncService.onCommand('start_record', async cmd => {
       const sid = (cmd.payload as any)?.session_id as string | undefined;
-      const cfg = (cmd.payload as any)?.config as Record<string, unknown> | undefined;
-      if (sid) {
-        streamingService.setActiveSession(sid);
-        dbg(`Controller → BẮT ĐẦU GHI session=${sid.slice(0, 8)}: tự bật Phát sóng`);
-      } else {
-        streamingService.setActiveSession(null);
-        dbg('Controller → BẮT ĐẦU GHI (ko có session_id): tự bật Phát sóng');
-      }
-      // Nếu cấu hình yêu cầu record local (client side record & upload) → bấm luôn startRecording
-      if (cfg?.local_record === 1) {
-        void streamingService.startRecording();
-      }
-      await startBroadcast();
+      streamingService.setActiveSession(sid ?? null);
+      dbg(`Controller → BẮT ĐẦU GHI session=${sid?.slice(0, 8) ?? 'none'}: quay local`);
+      await startLocalRecording();
     });
-    // Controller bấm "Dừng ALL" → dừng phát, server auto-finalize MP4 cho từng Remote
-    //   + nếu có local recording đang chạy thì dừng + upload nó với session_id đã lưu
+    // Controller bấm "Dừng ALL" → dừng quay + upload clip với session_id đã lưu
     const offStop = deviceSyncService.onCommand('stop_record', async cmd => {
       const sid = (cmd.payload as any)?.session_id as string | undefined;
-      dbg(
-        `Controller → DỪNG GHI session=${(sid || 'unknown').slice(0, 8)}: tự dừng Phát sóng (server lưu broadcast)`,
-      );
-      await stopBroadcast();
-      // Nếu có video đang quay local thì dừng & upload nó theo session_id đã set trước đó
-      if (cameraService.isVideoRecording_?.()) {
-        const uri = await streamingService.stopRecording();
-        if (uri) {
-          streamingService.uploadRecording(uri, _p => {}).catch(e =>
-            logger.error('Local upload after stop_record failed', e),
-          );
-        }
-      }
-      // Xoá session sau khi đã gửi lệnh dừng & upload (đặt timeout để luồng upload kịp đọc state)
-      setTimeout(() => streamingService.setActiveSession(null), 15_000);
+      dbg(`Controller → DỪNG GHI session=${(sid || 'unknown').slice(0, 8)}: dừng quay + upload`);
+      await stopLocalRecording();
+      // uploadRecording đọc session_id đồng bộ lúc bắt đầu nên xoá ngay được
+      streamingService.setActiveSession(null);
     });
     return () => {
       offApproved();
@@ -388,7 +359,7 @@ export default function RemoteScreen() {
       offStart();
       offStop();
     };
-  }, [dbg, startBroadcast, stopBroadcast]);
+  }, [dbg, startLocalRecording, stopLocalRecording]);
 
   // Yêu cầu quyền Camera khi component mount
   useEffect(() => {
@@ -406,16 +377,15 @@ export default function RemoteScreen() {
     }
   }, [isWeb, micPermission, requestMicPermission]);
 
-  // Khởi tạo services và kết nối WebSocket (tự động kết nối lại khi đổi cấu hình server)
+  // Khởi tạo services
   useEffect(() => {
-    if (!deviceId || !wsUrl) {
+    if (!deviceId) {
       return;
     }
 
     logger.info('Initializing services', {
       deviceId,
       deviceName: deviceName.current,
-      wsUrl,
     });
 
     // Khởi tạo services
@@ -425,51 +395,11 @@ export default function RemoteScreen() {
       cameraName: 'Remote-' + deviceId.slice(-4),
     });
     localStore.initialize();
-
-    if (!ENABLE_SOCKET) {
-      // Socket tạm tắt — không kết nối, không đăng ký handler
-      return;
-    }
-
-    wsService.initialize(wsUrl, deviceId, deviceName.current, 'remote');
-
-    // Lắng nghe kết nối WebSocket
-    const unsubscribeConnection = wsService.onConnectionStateChange(connected => {
-      logger.info('WebSocket connection state changed', { connected });
-      setWsConnected(connected);
+    // M3 crash recovery: ghép các segment dở dang của lần chạy trước (nếu có) vào tab Files
+    void streamingService.recoverCrashedRecordings().then(n => {
+      if (n > 0) dbg(`Đã khôi phục ${n} video ghi dở từ phiên trước (tab Files)`);
     });
-
-    // Lắng nghe tin nhắn STREAM_START từ controller
-    const unsubscribeStreamStart = wsService.on('STREAM_START', message => {
-      logger.info('Received STREAM_START command', message);
-      handleStartStreamingRef.current();
-    });
-
-    // Lắng nghe tin nhắn STREAM_END từ controller
-    const unsubscribeStreamEnd = wsService.on('STREAM_END', message => {
-      logger.info('Received STREAM_END command', message);
-      handleStopStreamingRef.current();
-    });
-
-    return () => {
-      unsubscribeConnection();
-      unsubscribeStreamStart();
-      unsubscribeStreamEnd();
-      wsService.disconnect();
-      streamingService.reset();
-    };
-  }, [wsUrl, deviceId]);
-
-  // Update streaming stats
-  useEffect(() => {
-    if (isStreaming) {
-      const interval = setInterval(() => {
-        setStreamingStats(streamingService.getStreamingStats());
-      }, 1000);
-
-      return () => clearInterval(interval);
-    }
-  }, [isStreaming]);
+  }, [deviceId, dbg]);
 
   /**
    * Xử lý chụp ảnh + lưu local (không upload lên server)
@@ -497,40 +427,6 @@ export default function RemoteScreen() {
       setIsSaving(false);
     }
   }, [isSaving]);
-
-  /**
-   * Xử lý bắt đầu streaming
-   */
-  const handleStartStreaming = useCallback(() => {
-    if (!isCameraReady) {
-      Alert.alert('Lỗi', 'Camera chưa sẵn sàng');
-      return;
-    }
-
-    if (!wsConnected) {
-      Alert.alert('Lỗi', 'WebSocket chưa kết nối');
-      return;
-    }
-
-    logger.info('Starting streaming');
-    streamingService.startStreaming(5, 0.8);
-    setIsStreaming(true);
-  }, [isCameraReady, wsConnected]);
-
-  /**
-   * Xử lý dừng streaming
-   */
-  const handleStopStreaming = useCallback(() => {
-    logger.info('Stopping streaming');
-    streamingService.stopStreaming();
-    setIsStreaming(false);
-  }, []);
-
-  // Cập nhật refs với handler mới nhất mỗi lần render (để WS handler không bị stale closure)
-  useEffect(() => {
-    handleStartStreamingRef.current = handleStartStreaming;
-    handleStopStreamingRef.current = handleStopStreaming;
-  });
 
   // UI cho web platform (không hỗ trợ)
   if (isWeb) {
@@ -572,6 +468,7 @@ export default function RemoteScreen() {
           style={styles.camera}
           facing="back"
           mode="video"
+          videoQuality="1080p"
           onCameraReady={() => {
             logger.info('Camera is ready (onCameraReady fired)', {
               micStatus: micPermission?.status ?? 'unknown',
@@ -623,19 +520,6 @@ export default function RemoteScreen() {
 
           {/* Status chips */}
           <View style={styles.statusRow}>
-            {!ENABLE_SOCKET ? (
-              <View style={[styles.chip, styles.buttonDisabled]}>
-                <View style={[styles.chipDot, styles.dotDanger]} />
-                <Text style={styles.chipText}>Socket tạm tắt</Text>
-              </View>
-            ) : (
-              <View style={[styles.chip, wsConnected ? styles.chipSuccess : styles.chipDanger]}>
-                <View
-                  style={[styles.chipDot, wsConnected ? styles.dotSuccess : styles.dotDanger]}
-                />
-                <Text style={styles.chipText}>{wsConnected ? 'Đã kết nối' : 'Chưa kết nối'}</Text>
-              </View>
-            )}
             <View style={[styles.chip, isCameraReady ? styles.chipSuccess : styles.chipDanger]}>
               <View
                 style={[styles.chipDot, isCameraReady ? styles.dotSuccess : styles.dotDanger]}
@@ -680,8 +564,14 @@ export default function RemoteScreen() {
                     paddingHorizontal: 10,
                     paddingVertical: 6,
                     borderRadius: 8,
+                    opacity: isRecording ? 0.45 : 1,
                   }}
                   onPress={async () => {
+                    // shortcut: Chặn đổi cam khi đang ghi để không đổi kích thước/orientation giữa các segment
+                    if (isRecording) {
+                      Alert.alert('Đang quay', 'Không thể đổi camera trong khi đang ghi hình.');
+                      return;
+                    }
                     try {
                       const m = await mediasoupClientService.switchCamera();
                       const s = mediasoupClientService.getLocalStream();
@@ -700,12 +590,34 @@ export default function RemoteScreen() {
               </View>
             </View>
           )}
-          {isStreaming && streamingStats && (
+          {isPreviewing && previewState === 'reconnecting' && (
             <View style={[styles.alertBox, styles.alertStreaming]}>
               <Text style={styles.alertTitle}>
-                📹 Đang stream · {streamingStats.currentFPS?.toFixed(1) || 0} FPS
+                ⚠️ Mất kết nối preview, đang kết nối lại…
+                {isRecording ? ' (ghi hình vẫn tiếp tục)' : ''}
               </Text>
-              <Text style={styles.alertSub}>Buffer: {streamingStats.bufferedFrames} frames</Text>
+            </View>
+          )}
+          {isPreviewing && previewState === 'failed' && (
+            <View style={[styles.alertBox, styles.alertRecording]}>
+              <Text style={styles.alertTitle}>
+                ⛔ Preview đã dừng{isRecording ? ' (ghi hình vẫn tiếp tục)' : ''} — bấm Dừng phát
+                rồi Phát sóng để phát lại
+              </Text>
+            </View>
+          )}
+          {isRecording && (
+            <View style={[styles.alertBox, styles.alertRecording]}>
+              <Text style={styles.alertTitle}>
+                {isPreviewing
+                  ? '⏺ Đang quay (1080p) — preview vẫn đang phát'
+                  : '⏺ Đang quay — preview tạm dừng'}
+              </Text>
+            </View>
+          )}
+          {uploadPercent !== null && (
+            <View style={[styles.alertBox, styles.alertSaving]}>
+              <Text style={styles.alertTitle}>⬆️ Đang upload video {uploadPercent}%</Text>
             </View>
           )}
 
@@ -812,78 +724,6 @@ export default function RemoteScreen() {
                   <Text style={{ color: '#fff', fontWeight: '700' }}>Join</Text>
                 </TouchableOpacity>
               </View>
-              <View
-                style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  marginTop: 12,
-                  borderTopWidth: 1,
-                  borderTopColor: 'rgba(255,255,255,0.15)',
-                  paddingTop: 10,
-                }}>
-                <Text style={{ color: '#fff', fontWeight: '700', fontSize: 12 }}>
-                  🏠 Phòng đang mở trên LAN
-                </Text>
-                <TouchableOpacity
-                  style={{
-                    backgroundColor: 'rgba(148,163,184,0.3)',
-                    paddingHorizontal: 10,
-                    paddingVertical: 5,
-                    borderRadius: 8,
-                  }}
-                  onPress={loadOpenRooms}>
-                  <Text style={{ color: '#fff', fontWeight: '700', fontSize: 12 }}>
-                    {roomsLoading ? '⏳ Đang quét...' : '🔄 Quét lại'}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-              {openRooms && (
-                <View style={{ marginTop: 8 }}>
-                  {openRooms.length === 0 ? (
-                    <Text style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12 }}>
-                      Không có phòng nào đang mở trên LAN.
-                    </Text>
-                  ) : (
-                    openRooms.slice(0, 6).map(r => (
-                      <View
-                        key={r.invite_code}
-                        style={{
-                          flexDirection: 'row',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          paddingVertical: 6,
-                          borderBottomWidth: 1,
-                          borderBottomColor: 'rgba(255,255,255,0.08)',
-                        }}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={{ color: '#fff', fontSize: 13, fontWeight: '600' }}>
-                            {r.room_name || 'Phòng không tên'}
-                          </Text>
-                          <Text style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11 }}>
-                            {r.member_count ?? 0} thành viên{r.auto_approve ? ' • vào tự do' : ''} ·{' '}
-                            <Text style={{ fontFamily: 'monospace' }}>{r.invite_code}</Text>
-                          </Text>
-                        </View>
-                        <TouchableOpacity
-                          style={{
-                            backgroundColor: '#10b981',
-                            paddingHorizontal: 14,
-                            paddingVertical: 6,
-                            borderRadius: 8,
-                            marginLeft: 8,
-                          }}
-                          disabled={!deviceId}
-                          onPress={() => doJoin(r.invite_code, r.room_name)}>
-                          <Text style={{ color: '#fff', fontWeight: '700', fontSize: 12 }}>
-                            Vào
-                          </Text>
-                        </TouchableOpacity>
-                      </View>
-                    ))
-                  )}
-                </View>
-              )}
             </View>
           )}
         </View>

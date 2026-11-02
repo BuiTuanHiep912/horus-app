@@ -36,7 +36,7 @@ import type { MyRoom } from '../api/rooms';
 import { getDeviceId } from '../utils/device';
 import { useRoomSync } from '../hooks/useRoomSync';
 import { useAuthSession } from '../hooks/useAuthSession';
-import { mediasoupClientService } from '../services/mediasoupClient';
+import { mediasoupClientService, type PreviewState } from '../services/mediasoupClient';
 import { ApiError } from '../api/client';
 
 function RTCFrame({
@@ -101,15 +101,22 @@ export default function ControllerScreen() {
   const { data: syncData } = useRoomSync(roomId, !!roomId);
   const [mediaLog, setMediaLog] = useState<string[]>([]);
   const [streams, setStreams] = useState<Map<string, any>>(new Map());
+  const [iceStates, setIceStates] = useState<Map<string, string>>(new Map());
+  const [previewState, setPreviewState] = useState<PreviewState>('idle');
+  const [previewDetail, setPreviewDetail] = useState<string | undefined>();
   const [isPreviewing, setIsPreviewing] = useState(false);
   const [fullMember, setFullMember] = useState<string | null>(null);
   const [showLog, setShowLog] = useState(false);
   const [joinCode, setJoinCode] = useState('');
   const [joinLog, setJoinLog] = useState<string[]>([]);
   const [autoApprove, setAutoApprove] = useState<0 | 1>(1);
-  const [openForJoin, setOpenForJoin] = useState<0 | 1>(1);
   const [myRooms, setMyRooms] = useState<MyRoom[] | null>(null);
   const previewCleanupRef = useRef<(() => void) | null>(null);
+  const appendLog = useCallback(
+    (m: string) =>
+      setMediaLog(prev => [...prev.slice(-40), `${new Date().toLocaleTimeString()} ${m}`]),
+    [],
+  );
   const autoCreateRef = useRef(false);
   const { session } = useAuthSession();
 
@@ -135,11 +142,24 @@ export default function ControllerScreen() {
     getDeviceId().then(setDeviceId);
   }, []);
 
+  // Trạng thái nối lại preview từ service; rời màn hình thì ngắt hẳn để vòng retry không chạy ngầm
+  useEffect(() => {
+    const off = mediasoupClientService.subscribe((st, detail) => {
+      setPreviewState(st);
+      setPreviewDetail(detail);
+      if (st !== 'idle') appendLog(`preview ${st}${detail ? ` (${detail})` : ''}`);
+    });
+    return () => {
+      off();
+      previewCleanupRef.current?.();
+    };
+  }, [appendLog]);
+
   // Controller tự TẠO phòng riêng + join luôn khi mở app (chỉ 1 lần): vì các
   // route approve/kick/sync chỉ cho phép OWNER (requireOwnerRoom), controller
   // join phòng của user khác (vd phòng chung của default-room@) sẽ bị 401 →
-  // "không join quản lý được". Tự tạo phòng (mở trên LAN, tự duyệt) để controller
-  // là owner: remote quét LAN thấy phòng, tap là vào ngay.
+  // "không join quản lý được". Tự tạo phòng (tự duyệt) để controller
+  // là owner: remote nhập mã mời là vào ngay.
   useEffect(() => {
     if (roomId || !deviceId || session?.accountRole !== 'controller' || autoCreateRef.current) {
       return;
@@ -148,7 +168,7 @@ export default function ControllerScreen() {
     (async () => {
       try {
         logger.info('Auto-create phòng cho controller', { deviceId });
-        const r = await createRoom({ max_members: 16, auto_approve: 1, open_for_join: 1 });
+        const r = await createRoom({ max_members: 16, auto_approve: 1 });
         setRoomId(r.room_id);
         setInvite(r.invite_code);
         setInviteExpires(r.expires_at ?? null);
@@ -176,7 +196,6 @@ export default function ControllerScreen() {
       const r = await createRoom({
         max_members: 16,
         auto_approve: autoApprove,
-        open_for_join: openForJoin,
       });
       setRoomId(r.room_id);
       setInvite(r.invite_code);
@@ -204,7 +223,7 @@ export default function ControllerScreen() {
     } finally {
       setLoading(false);
     }
-  }, [deviceId, autoApprove, openForJoin, loadMyRooms]);
+  }, [deviceId, autoApprove, loadMyRooms]);
 
   const handleRefreshCode = useCallback(async () => {
     if (!roomId) return;
@@ -232,16 +251,12 @@ export default function ControllerScreen() {
       return;
     }
     try {
-      const append = (m: string) =>
-        setMediaLog(prev => [...prev.slice(-40), `${new Date().toLocaleTimeString()} ${m}`]);
-      append('Đang nối mediasoup...');
+      appendLog('Đang nối mediasoup...');
       setIsPreviewing(true);
       const cleanup = await mediasoupClientService.startConsuming(
         roomId,
         (memberId, stream) => {
-          append(
-            `onStream member=${memberId.slice(0, 6)} kind=${stream.getVideoTracks().length ? 'video' : 'audio'}`,
-          );
+          appendLog(`onStream member=${memberId.slice(0, 6)}`);
           setStreams(prev => {
             const next = new Map(prev);
             next.set(memberId, stream);
@@ -249,23 +264,32 @@ export default function ControllerScreen() {
           });
         },
         memberId => {
-          append(`producer-closed member=${memberId.slice(0, 6)}`);
+          appendLog(`producer-closed member=${memberId.slice(0, 6)}`);
           setStreams(prev => {
+            const next = new Map(prev);
+            next.delete(memberId);
+            return next;
+          });
+          setIceStates(prev => {
             const next = new Map(prev);
             next.delete(memberId);
             return next;
           });
           setFullMember(prev => (prev === memberId ? null : prev));
         },
+        (memberId, iceState) =>
+          setIceStates(prev =>
+            prev.get(memberId) === iceState ? prev : new Map(prev).set(memberId, iceState),
+          ),
       );
       previewCleanupRef.current = cleanup;
-      append('Preview đang chạy — chờ Remote produce');
+      appendLog('Preview đang chạy — chờ Remote produce');
     } catch (e) {
       logger.error('Preview connect failed', e);
       setIsPreviewing(false);
       Alert.alert('Preview lỗi', String(e instanceof Error ? e.message : e));
     }
-  }, [roomId]);
+  }, [roomId, appendLog]);
 
   const handleStopPreview = useCallback(() => {
     const c = previewCleanupRef.current;
@@ -275,9 +299,22 @@ export default function ControllerScreen() {
     } catch {}
     mediasoupClientService.disconnect();
     setStreams(new Map());
+    setIceStates(new Map());
     setFullMember(null);
     setIsPreviewing(false);
   }, []);
+
+  // Remote mất ICE thì tile giữ frame cuối; báo để biết hình đang đứng
+  const isSignalLost = (memberId: string) =>
+    ['disconnected', 'failed', 'closed'].includes(iceStates.get(memberId) ?? '');
+  const previewStatus =
+    previewState === 'connecting'
+      ? 'Đang kết nối preview…'
+      : previewState === 'reconnecting'
+        ? 'Mất kết nối, đang kết nối lại preview…'
+        : previewState === 'failed'
+          ? `Preview đã dừng${previewDetail ? `: ${previewDetail}` : ''} — bấm Ngắt rồi bật lại`
+          : null;
 
   const gridGap = spacing.sm;
   const cellWidth = (width - spacing.lg * 2 - gridGap) / 2;
@@ -341,49 +378,6 @@ export default function ControllerScreen() {
                   </Text>
                 </TouchableOpacity>
               </View>
-            </View>
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Hiển thị trên LAN</Text>
-              <View style={styles.row}>
-                <TouchableOpacity
-                  style={[
-                    styles.segBtn,
-                    {
-                      flex: 1,
-                      backgroundColor: openForJoin === 0 ? colors.primary : colors.background,
-                    },
-                  ]}
-                  onPress={() => setOpenForJoin(0)}>
-                  <Text
-                    style={[
-                      styles.segText,
-                      { color: openForJoin === 0 ? colors.white : colors.textSecondary },
-                    ]}>
-                    🔒 Chỉ dùng mã mời
-                  </Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[
-                    styles.segBtn,
-                    {
-                      flex: 1,
-                      backgroundColor: openForJoin === 1 ? colors.primary : colors.background,
-                    },
-                  ]}
-                  onPress={() => setOpenForJoin(1)}>
-                  <Text
-                    style={[
-                      styles.segText,
-                      { color: openForJoin === 1 ? colors.white : colors.textSecondary },
-                    ]}>
-                    📡 Mở trên LAN
-                  </Text>
-                </TouchableOpacity>
-              </View>
-              <Text style={styles.muted}>
-                Mở trên LAN: mọi phone cùng Wi-Fi nhìn thấy phòng trong màn đăng nhập, tap là join —
-                không cần gõ mã mời.
-              </Text>
             </View>
             <TouchableOpacity style={styles.primaryBtn} onPress={handleCreate} disabled={loading}>
               {loading ? (
@@ -471,6 +465,7 @@ export default function ControllerScreen() {
                   <TouchableOpacity
                     style={[styles.cellBtn, { backgroundColor: colors.danger }]}
                     onPress={async () => {
+                      if (isPreviewing) handleStopPreview();
                       setFullMember(null);
                       await closeRoom(roomId);
                       setRoomId(null);
@@ -480,6 +475,7 @@ export default function ControllerScreen() {
                   <TouchableOpacity
                     style={[styles.cellBtn, { backgroundColor: colors.textSecondary }]}
                     onPress={async () => {
+                      if (isPreviewing) handleStopPreview();
                       setFullMember(null);
                       await leaveRoom(roomId);
                       setRoomId(null);
@@ -501,7 +497,16 @@ export default function ControllerScreen() {
                     onPress={handleStopPreview}>
                     <Text style={styles.btnText}>⏹ Ngắt xem trực tiếp</Text>
                   </TouchableOpacity>
-                  {streamEntries.length === 0 && (
+                  {previewStatus && (
+                    <Text
+                      style={[
+                        styles.muted,
+                        { color: previewState === 'failed' ? colors.danger : colors.warning },
+                      ]}>
+                      {previewStatus}
+                    </Text>
+                  )}
+                  {streamEntries.length === 0 && previewState === 'live' && (
                     <View style={styles.waitingBox}>
                       <ActivityIndicator color={colors.primary} />
                       <Text style={styles.muted}>
@@ -524,6 +529,7 @@ export default function ControllerScreen() {
                 <RTCFrame
                   stream={streams.get(fullMember)}
                   name={memberName.get(fullMember) ?? fullMember.slice(0, 8)}
+                  sub={isSignalLost(fullMember) ? '⚠️ mất tín hiệu' : undefined}
                 />
               </View>
             ) : (
@@ -531,19 +537,16 @@ export default function ControllerScreen() {
                 <View style={styles.card}>
                   <Text style={styles.cardTitle}>Camera đang phát ({streamEntries.length})</Text>
                   <View style={styles.grid}>
-                    {streamEntries.map(([mid, stream]) => {
-                      const audioOnly = stream.getVideoTracks().length === 0;
-                      return (
-                        <View key={mid} style={{ width: cellWidth }}>
-                          <RTCFrame
-                            stream={stream}
-                            name={memberName.get(mid) ?? mid.slice(0, 8)}
-                            sub={audioOnly ? '🔊 audio' : undefined}
-                            onPress={() => setFullMember(mid)}
-                          />
-                        </View>
-                      );
-                    })}
+                    {streamEntries.map(([mid, stream]) => (
+                      <View key={mid} style={{ width: cellWidth }}>
+                        <RTCFrame
+                          stream={stream}
+                          name={memberName.get(mid) ?? mid.slice(0, 8)}
+                          sub={isSignalLost(mid) ? '⚠️ mất tín hiệu' : undefined}
+                          onPress={() => setFullMember(mid)}
+                        />
+                      </View>
+                    ))}
                   </View>
                   <Text style={styles.scanNote}>
                     Tap camera để xem toàn màn hình. Camera đã tắt phát sẽ tự biến mất.
@@ -676,8 +679,7 @@ export default function ControllerScreen() {
                           {isCurrent ? '  👈 đang dùng' : ''}
                         </Text>
                         <Text style={styles.muted}>
-                          {r.invite_code} · {r.member_count}/{r.max_members} thành viên ·{' '}
-                          {r.open_for_join ? 'mở trên LAN' : 'chỉ mã mời'} · {r.status}
+                          {r.invite_code} · {r.member_count}/{r.max_members} thành viên · {r.status}
                         </Text>
                       </View>
                       {!isCurrent && (

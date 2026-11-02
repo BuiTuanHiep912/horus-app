@@ -110,7 +110,7 @@ export interface InitUploadPayload {
   file_name: string;
   file_size: number;
   mime_type: 'video/mp4';
-  checksum_sha256: string;
+  checksum_sha256?: string;
   metadata: {
     local_video_uid: string;
     device_id: string;
@@ -126,25 +126,11 @@ export interface InitUploadPayload {
 
 export interface InitUploadData {
   upload_id: string | null;
-  chunk_size: number;
-  total_chunks: number;
+  /** Presigned PUT URL (không gửi Authorization) */
+  upload_url: string | null;
   expires_at: string | null;
   already_uploaded: 0 | 1;
   video_id: string | null;
-}
-
-export interface UploadChunkData {
-  chunk_index: number;
-  received: number;
-  next_expected_index: number | null;
-}
-
-export interface UploadStatusData {
-  upload_id: string;
-  status: string;
-  received_chunks: number[];
-  missing_chunks: number[];
-  expires_at: string;
 }
 
 export interface CompleteUploadData {

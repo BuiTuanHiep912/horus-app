@@ -1,15 +1,14 @@
 /**
  * API Client
  * Lớp HTTP dùng chung cho toàn bộ API v1:
- * - Tự ghép base URL từ cấu hình server (host/port + prefix /it4788/api/v1)
+ * - Tự ghép base URL từ cấu hình server (baseUrl + prefix /it4788/api/v1)
  * - Tự gắn Authorization: Bearer <access_token>
  * - Tự refresh token (rotation) khi gặp mã 9998/9993 rồi thử lại request 1 lần
  */
 
-import { serverConfigService } from '../services/serverConfig';
+import { apiUrl, serverConfigService } from '../services/serverConfig';
 import { authStore } from '../services/authStore';
 import { logger } from '../utils/logger';
-import { base64ToUint8Array } from '../utils/base64';
 import { ApiEnvelope, API_CODES, LOCAL_CODES } from './types';
 
 export class ApiError extends Error {
@@ -50,20 +49,6 @@ export async function refreshSession(): Promise<boolean> {
   return refreshingPromise;
 }
 
-function decodeJwtPayload(jwt: string): any {
-  try {
-    const part = jwt.split('.')[1] || '';
-    const bytes = base64ToUint8Array(part.replace(/-/g, '+').replace(/_/g, '/'));
-    let json = '';
-    for (let i = 0; i < bytes.length; i++) {
-      json += String.fromCharCode(bytes[i]);
-    }
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
-}
-
 async function doRefresh(): Promise<boolean> {
   const session = await authStore.load();
   if (!session?.refreshToken) {
@@ -72,18 +57,13 @@ async function doRefresh(): Promise<boolean> {
   }
 
   const refreshTokenUsed = session.refreshToken;
-  const payload = decodeJwtPayload(refreshTokenUsed);
-  logger.info('Refreshing token', {
-    rtPrefix: refreshTokenUsed.slice(0, 12),
-    deviceId: payload?.device_id,
-    userId: payload?.sub,
-  });
+  logger.info('Refreshing token');
 
   const config = await serverConfigService.load();
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
-    const response = await fetch(serverConfigService.apiUrl(config) + '/auth/refresh', {
+    const response = await fetch(apiUrl(config) + '/auth/refresh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: refreshTokenUsed }),
@@ -96,7 +76,6 @@ async function doRefresh(): Promise<boolean> {
       logger.warn('Token refresh rejected', {
         code: envelope.code,
         message: envelope.message,
-        rtPrefix: refreshTokenUsed.slice(0, 12),
       });
       // Chỉ xóa phiên nếu vẫn còn là phiên vừa refresh thất bại,
       // tránh xóa nhầm phiên mới hơn (ví dụ user vừa đăng nhập lại)
@@ -130,7 +109,7 @@ async function rawRequest(
   accessToken: string | null,
 ): Promise<Response> {
   const config = await serverConfigService.load();
-  const url = `${serverConfigService.apiUrl(config)}${path}`;
+  const url = `${apiUrl(config)}${path}`;
 
   const headers: Record<string, string> = { ...(options.headers || {}) };
   if (accessToken) {

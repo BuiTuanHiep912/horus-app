@@ -7,7 +7,7 @@
  */
 import { logger } from '../utils/logger';
 import { authStore } from './authStore';
-import { serverConfigService } from './serverConfig';
+import { serverConfigService, wsUrl } from './serverConfig';
 import { getPreviewToken } from '../api/rooms';
 
 export type MediaRole = 'controller' | 'remote';
@@ -21,12 +21,18 @@ export interface MediaState {
 
 type MessageHandler = (msg: Record<string, unknown>) => void;
 
+const PING_INTERVAL_MS = 10000;
+const PING_TIMEOUT_MS = 5000;
+
 class MediasoupService {
   private ws: WebSocket | null = null;
   private roomId: string | null = null;
   private state: MediaState = { connected: false, role: null, participantId: null, rtpCapabilities: null };
   private handlers = new Map<string, Set<MessageHandler>>();
   private previewToken: string | null = null;
+  private connectSeq = 0;
+  private abortWelcome: (() => void) | null = null;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
 
   public getState(): MediaState {
     return { ...this.state };
@@ -57,50 +63,45 @@ class MediasoupService {
   /** Lấy preview_token + mở WS signaling (auth Bearer). */
   public async connect(roomId: string, opts: { quality: 'low' | 'medium'; protocol: 'hls' | 'webrtc' }): Promise<void> {
     this.disconnect();
+    const seq = this.connectSeq;
     this.roomId = roomId;
+    // disconnect() có thể xen vào lúc đang await REST/storage → không được mở socket sau đó
+    const cancelled = () => seq !== this.connectSeq;
 
     const preview = await getPreviewToken(roomId, opts);
+    if (cancelled()) throw new Error('Mediasoup connect cancelled');
     this.previewToken = preview.preview_token;
-    logger.info('Preview token obtained', { roomId, token: preview.preview_token.slice(0, 8) });
+    logger.info('Preview token obtained', { roomId });
 
     const config = await serverConfigService.load();
-    // signaling_url là "/it4788/api/v1/rooms/:id/media" — ghép thành ws(s)://host:port + path
-    const httpUrl = serverConfigService.httpUrl(config);
-    const wsBase = httpUrl.replace(/^http/, 'ws');
-    const signalingUrl = `${wsBase}${preview.signaling_url}`;
+    // signaling_url là "/it4788/api/v1/rooms/:id/media" — ghép thành ws(s)://host + path
+    const signalingUrl = `${wsUrl(config)}${preview.signaling_url}`;
 
     const session = await authStore.load();
     if (!session?.accessToken) throw new Error('No access token for mediasoup WS');
+    if (cancelled()) throw new Error('Mediasoup connect cancelled');
 
-    // React Native WebSocket không hỗ trợ custom header trực tiếp → dùng query hoặc subprotocol.
-    // Thử header cho web; fallback thêm token vào URL nếu server hỗ trợ.
-    const urlWithAuth = `${signalingUrl}?token=${encodeURIComponent(session.accessToken)}`;
+    logger.info('Connecting mediasoup WS', { signalingUrl });
 
-    logger.info('Connecting mediasoup WS', { signalingUrl, wsUrl: urlWithAuth });
-
-    // @ts-ignore — RN WebSocket ctor có thể nhận headers ở một số polyfill
-    this.ws = new WebSocket(urlWithAuth, undefined, {
+    // Server chỉ đọc Authorization từ handshake; RN WebSocket nhận headers qua tham số thứ 3
+    // @ts-ignore — kiểu DOM WebSocket không có tham số options
+    const ws: WebSocket = new WebSocket(signalingUrl, undefined, {
       headers: { Authorization: `Bearer ${session.accessToken}` },
     } as unknown as string[]);
+    this.ws = ws;
 
-    // Gắn thêm header cho môi trường hỗ trợ (web)
-    // Nhiều server Fastify @fastify/websocket đọc Authorization từ handshake headers
-    try {
-      // @ts-ignore — thử gửi auth qua extension header nếu được
-      if (this.ws && 'headers' in this.ws) logger.debug('WS headers set');
-    } catch {}
-
-    this.ws.onopen = () => {
+    // Mọi callback kiểm this.ws === ws: socket cũ (đã bị thay/disconnect) không được đụng state của socket mới
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
       logger.info('Mediasoup WS open');
-      // Với một số build, gửi auth message ngay sau open nếu header không tới server
-      // (server sẽ kiểm preHandler authenticate – nếu fail sẽ trả error + close)
     };
 
-    this.ws.onmessage = (event: MessageEvent) => {
+    ws.onmessage = (event: MessageEvent) => {
+      if (this.ws !== ws) return;
       try {
         const msg = JSON.parse(event.data) as Record<string, unknown>;
         const type = String(msg.type ?? 'unknown');
-        logger.debug('Mediasoup WS message', { type, msg });
+        logger.debug('Mediasoup WS message', { type });
         // resolve pending request nếu có request_id
         const reqId = msg.request_id as string | undefined;
         if (reqId && this.pending.has(reqId)) {
@@ -117,6 +118,7 @@ class MediasoupService {
             participantId: msg.participant_id as string,
             rtpCapabilities: msg.rtp_capabilities ?? null,
           };
+          this.startPing(ws);
         }
         this.emit(type, msg);
       } catch (e) {
@@ -124,40 +126,102 @@ class MediasoupService {
       }
     };
 
-    this.ws.onclose = () => {
-      logger.info('Mediasoup WS closed');
-      this.state = { connected: false, role: null, participantId: null, rtpCapabilities: null };
-      this.emit('close', {});
+    ws.onclose = (e: { code?: number }) => {
+      if (this.ws !== ws) return;
+      logger.info('Mediasoup WS closed', { code: e?.code });
+      this.handleClosed(e?.code ?? 1006);
     };
 
-    this.ws.onerror = (e: unknown) => {
+    ws.onerror = (e: unknown) => {
+      if (this.ws !== ws) return;
       logger.error('Mediasoup WS error', e);
       this.emit('error', { error: e } as unknown as Record<string, unknown>);
     };
 
     // Chờ welcome hoặc error trong 10s
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Mediasoup welcome timeout')), 10000);
-      const offWelcome = this.on('welcome', () => {
-        clearTimeout(timeout);
-        offWelcome();
-        offError();
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const done = () => {
+          clearTimeout(timeout);
+          offWelcome();
+          offError();
+          offClose();
+          this.abortWelcome = null;
+        };
+        const timeout = setTimeout(() => {
+          done();
+          reject(new Error('Mediasoup welcome timeout'));
+        }, 10000);
+        const offWelcome = this.on('welcome', () => {
+          done();
+          resolve();
+        });
+        const offError = this.on('error', msg => {
+          done();
+          reject(new Error(String((msg as Record<string, unknown>).message ?? 'Mediasoup error')));
+        });
+        const offClose = this.on('close', msg => {
+          done();
+          reject(Object.assign(new Error('WS closed before welcome'), { code: msg.code }));
+        });
+        this.abortWelcome = () => {
+          done();
+          reject(new Error('Mediasoup connect cancelled'));
+        };
       });
-      const offError = this.on('error', msg => {
-        clearTimeout(timeout);
-        offWelcome();
-        offError();
-        reject(new Error(String((msg as Record<string, unknown>).message ?? 'Mediasoup error')));
-      });
-      const offClose = this.on('close', () => {
-        clearTimeout(timeout);
-        offWelcome();
-        offError();
-        offClose();
-        reject(new Error('WS closed before welcome'));
-      });
+    } catch (e) {
+      // connect hỏng giữa chừng thì không để socket treo
+      if (this.ws === ws) this.disconnect();
+      throw e;
+    }
+  }
+
+  /** Socket đã đóng (server đóng, mạng rớt hoặc ping timeout): dọn state, huỷ request treo, báo `close` kèm code. */
+  private handleClosed(code: number): void {
+    this.stopPing();
+    this.ws = null;
+    this.state = { connected: false, role: null, participantId: null, rtpCapabilities: null };
+    this.rejectPending(new Error(`mediasoup ws closed (${code})`));
+    this.emit('close', { code });
+  }
+
+  private rejectPending(err: Error): void {
+    const all = [...this.pending.values()];
+    this.pending.clear();
+    all.forEach(p => {
+      clearTimeout(p.timer);
+      p.reject(err);
     });
+  }
+
+  private stopPing(): void {
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = null;
+  }
+
+  // WS ping frame của server không lộ ra JS nên tự ping bằng message; cũng giữ socket sống qua NAT khi phone rảnh.
+  private startPing(ws: WebSocket): void {
+    this.stopPing();
+    this.pingTimer = setInterval(() => {
+      if (this.ws !== ws) return;
+      let req: Promise<Record<string, unknown>>;
+      try {
+        req = this.sendRequest({ type: 'ping' }, PING_TIMEOUT_MS);
+      } catch {
+        return; // socket không còn OPEN → onclose sẽ tới
+      }
+      req.catch(e => {
+        // Server cũ trả `error` cho ping = socket vẫn sống; chỉ TIMEOUT mới là half-open
+        if ((e as { code?: string })?.code !== 'timeout' || this.ws !== ws) return;
+        logger.warn('Mediasoup WS ping timeout — đóng socket');
+        ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+        try {
+          ws.close();
+        } catch {}
+        // không đợi ws.close() xong vì socket half-open có thể treo rất lâu
+        this.handleClosed(1006);
+      });
+    }, PING_INTERVAL_MS);
   }
 
   // ── Helpers gửi JSON có request_id ──
@@ -171,7 +235,7 @@ class MediasoupService {
     const reqId = `req_${++this.reqId}`;
     const withId = { request_id: reqId, ...payload };
     this.ws.send(JSON.stringify(withId));
-    logger.debug('Mediasoup WS send', withId);
+    logger.debug('Mediasoup WS send', { type: payload.type, request_id: reqId });
     return reqId;
   }
 
@@ -180,7 +244,11 @@ class MediasoupService {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(reqId);
-        reject(new Error(`mediasoup request timeout: ${payload.type}`));
+        reject(
+          Object.assign(new Error(`mediasoup request timeout: ${payload.type}`), {
+            code: 'timeout',
+          }),
+        );
       }, timeoutMs);
       this.pending.set(reqId, { resolve, reject, timer });
     });
@@ -237,12 +305,19 @@ class MediasoupService {
   }
 
   public disconnect(): void {
-    if (this.ws) {
+    this.connectSeq++;
+    this.stopPing();
+    this.abortWelcome?.();
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
+      // gỡ handler trước để onclose muộn của socket này không bị coi là mất kết nối
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
       try {
-        this.ws.close();
+        ws.close();
       } catch {}
-      this.ws = null;
     }
+    this.rejectPending(new Error('mediasoup ws disconnected'));
     this.state = { connected: false, role: null, participantId: null, rtpCapabilities: null };
     this.roomId = null;
     this.previewToken = null;
