@@ -27,6 +27,8 @@ class DeviceSyncService {
   private deviceId: string = '';
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  // stop()+start() khi loop cũ còn đang await sync: loop cũ phải tự dừng, không thì chạy 2 poller song song
+  private loopGen = 0;
   private lastCommandId: string | null = null;
   private handlers = new Map<string, Set<DeviceCommandHandler>>();
   private telemetryProvider: (() => DeviceSyncTelemetry) | null = null;
@@ -73,7 +75,7 @@ class DeviceSyncService {
     }
     this.running = true;
     logger.info('DeviceSync polling started');
-    this.loop();
+    this.loop(++this.loopGen);
   }
 
   public stop(): void {
@@ -89,8 +91,8 @@ class DeviceSyncService {
     this.lastCommandId = id;
   }
 
-  private async loop(): Promise<void> {
-    if (!this.running) return;
+  private async loop(gen: number): Promise<void> {
+    if (!this.running || gen !== this.loopGen) return;
     let nextIn = 5000;
     try {
       const telem = this.telemetryProvider?.() ?? {};
@@ -98,6 +100,8 @@ class DeviceSyncService {
         ...telem,
         last_command_id: this.lastCommandId ?? undefined,
       });
+      // Bỏ kết quả: lệnh chưa ack nên loop mới vẫn nhận lại, không xử lý 2 lần
+      if (gen !== this.loopGen) return;
       nextIn = (data.next_sync_in ?? 5) * 1000;
 
       if (data.session_revoked === 1) {
@@ -176,8 +180,8 @@ class DeviceSyncService {
       }
     }
 
-    if (this.running) {
-      this.timer = setTimeout(() => this.loop(), nextIn);
+    if (this.running && gen === this.loopGen) {
+      this.timer = setTimeout(() => this.loop(gen), nextIn);
     }
   }
 }
