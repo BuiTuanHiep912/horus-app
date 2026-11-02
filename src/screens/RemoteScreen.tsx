@@ -32,7 +32,7 @@ import { getDeviceInfo } from '../services/deviceInfo';
 import { colors, spacing, radius } from '../constants/theme';
 import { useDeviceSync } from '../hooks/useDeviceSync';
 import { useAuthSession } from '../hooks/useAuthSession';
-import { mediasoupClientService } from '../services/mediasoupClient';
+import { mediasoupClientService, type PreviewState } from '../services/mediasoupClient';
 import { deviceSyncService } from '../services/deviceSync';
 import { joinRoom, leaveRoom } from '../api/rooms';
 import { ApiError } from '../api/client';
@@ -61,6 +61,7 @@ export default function RemoteScreen() {
   const [RTCViewComp, setRTCViewComp] = useState<any>(null);
   const [isFullscreenPreview, setIsFullscreenPreview] = useState(false);
   const [showTopBar, setShowTopBar] = useState(true);
+  const [previewState, setPreviewState] = useState<PreviewState>('idle');
   useEffect(() => {
     if (isPreviewing && !RTCViewComp) {
       import('react-native-webrtc')
@@ -84,6 +85,14 @@ export default function RemoteScreen() {
   useEffect(() => {
     dbgScrollRef.current?.scrollToEnd({ animated: true });
   }, [dbgLog]);
+  useEffect(
+    () =>
+      mediasoupClientService.subscribe((st, detail) => {
+        setPreviewState(st);
+        if (st !== 'idle') dbg(`preview ${st}${detail ? ` (${detail})` : ''}`);
+      }),
+    [dbg],
+  );
 
   const cameraRef = useRef<CameraView | null>(null);
 
@@ -579,6 +588,22 @@ export default function RemoteScreen() {
                   <Text style={{ color: '#fff', fontWeight: '700', fontSize: 12 }}>🔄 Đổi cam</Text>
                 </TouchableOpacity>
               </View>
+            </View>
+          )}
+          {isPreviewing && previewState === 'reconnecting' && (
+            <View style={[styles.alertBox, styles.alertStreaming]}>
+              <Text style={styles.alertTitle}>
+                ⚠️ Mất kết nối preview, đang kết nối lại…
+                {isRecording ? ' (ghi hình vẫn tiếp tục)' : ''}
+              </Text>
+            </View>
+          )}
+          {isPreviewing && previewState === 'failed' && (
+            <View style={[styles.alertBox, styles.alertRecording]}>
+              <Text style={styles.alertTitle}>
+                ⛔ Preview đã dừng{isRecording ? ' (ghi hình vẫn tiếp tục)' : ''} — bấm Dừng phát
+                rồi Phát sóng để phát lại
+              </Text>
             </View>
           )}
           {isRecording && (
