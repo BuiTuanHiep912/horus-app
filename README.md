@@ -29,6 +29,12 @@
    npm start
    ```
 
+### iPhone (iOS)
+
+Build và cài app lên iPhone, build lại khi app hết hạn (Apple ID miễn phí: 7 ngày), và các lỗi
+thường gặp: [docs/ios-local-setup.md](docs/ios-local-setup.md).
+Cách bật backend + MinIO trên Mac nằm ở repo `multicam-server` (`docs/local-lan-setup.md`).
+
 ## Biến môi trường
 
 - `WS_HOST`: địa chỉ IP hoặc hostname của server WebSocket.
